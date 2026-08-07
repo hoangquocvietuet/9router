@@ -59,11 +59,13 @@ const ANTHROPIC_BETA_BASE = [
   "token-efficient-tools-2026-03-28",
 ];
 const ANTHROPIC_BETA_HEAVY_AGENT = ["advanced-tool-use-2025-11-20", "effort-2025-11-24"];
+// 1M context window (tier-gated). Opus/Sonnet 4.x support it; unlocks >200k input.
+const ANTHROPIC_BETA_1M = ["context-1m-2025-08-07"];
 
-// Heavy-agent beta flags are gated to opus/sonnet — cheaper models don't need them.
+// Heavy-agent + 1M beta flags are gated to opus/sonnet — cheaper models don't need them.
 export function selectAnthropicBeta(model = "") {
   const flags = [...ANTHROPIC_BETA_BASE];
-  if (/^claude-(opus|sonnet)/.test(model)) flags.push(...ANTHROPIC_BETA_HEAVY_AGENT);
+  if (/^claude-(opus|sonnet)/.test(model)) flags.push(...ANTHROPIC_BETA_HEAVY_AGENT, ...ANTHROPIC_BETA_1M);
   return flags.join(",");
 }
 

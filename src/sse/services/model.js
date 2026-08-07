@@ -86,7 +86,19 @@ export async function getComboModels(modelStr) {
   // Only check if it's not in provider/model format
   if (modelStr.includes("/")) return null;
 
-  const combo = await getComboByName(modelStr);
+  let combo = await getComboByName(modelStr);
+  if (!combo) {
+    // A model alias may point at a combo name (e.g. "claude-opus-4-8[1m]" → "master").
+    // This lets a combo masquerade as a specific model id so the client (e.g. Claude
+    // Code) picks that model's context window, while routing still fans out across
+    // the combo's members. Only follow single-hop aliases whose target is a bare
+    // combo name (no "/", i.e. not a provider/model).
+    const aliases = await getModelAliases();
+    const target = aliases?.[modelStr];
+    if (typeof target === "string" && target && !target.includes("/")) {
+      combo = await getComboByName(target);
+    }
+  }
   if (combo && combo.models && combo.models.length > 0) {
     return combo.models;
   }

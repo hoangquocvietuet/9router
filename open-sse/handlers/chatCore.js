@@ -1,6 +1,6 @@
 import { detectFormat, getTargetFormat, resolveTransport } from "../services/provider.js";
 import { translateRequest } from "../translator/index.js";
-import { applyThinking, extractThinking, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
+import { applyThinking, extractThinking, parseSuffix, stripThinkingSuffix } from "../translator/concerns/thinkingUnified.js";
 import { FORMATS } from "../translator/formats.js";
 import { normalizeClaudePassthrough } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
@@ -167,6 +167,18 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           effort: suffixThinking.reasoning_effort,
         };
         delete translatedBody.reasoning_effort;
+      }
+    } else {
+      // Other native passthroughs (e.g. claude): honor an EXPLICIT thinking override —
+      // a per-model level suffix "model(level)" or a provider-level thinking config —
+      // by routing the body through applyThinking, which writes this provider's NATIVE
+      // field (e.g. Anthropic `thinking`) and strips any client-format field like
+      // `reasoning_effort` that would 400 on Anthropic. Skipped when no override is set
+      // so ordinary passthrough stays byte-for-byte lossless.
+      const { override: suffixOverride } = parseSuffix(upstreamModel);
+      const hasProviderThinking = providerThinking?.mode && providerThinking.mode !== "auto";
+      if (suffixOverride || hasProviderThinking) {
+        applyThinking(targetFormat, upstreamModel, translatedBody, provider);
       }
     }
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects

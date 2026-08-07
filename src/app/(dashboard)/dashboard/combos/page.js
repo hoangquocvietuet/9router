@@ -9,9 +9,33 @@ import { Card, Button, Modal, Input, CardSkeleton, ModelSelectModal, ConfirmModa
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { useModelCaps } from "@/shared/hooks/useModelCaps";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
+import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
+import { resolveProviderAlias } from "open-sse/services/model.js";
 
 // Validate combo name: only a-z, A-Z, 0-9, -, _
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
+
+// Split a combo member "provider/model(level)" into its parts. `level` is null when
+// no thinking suffix is present. The suffix is the carrier for per-model thinking —
+// applyThinking() maps it to each provider's native field (Anthropic thinking budget,
+// OpenAI reasoning_effort, Gemini thinkingConfig, ...).
+function parseMember(value) {
+  if (typeof value !== "string") return { alias: "", baseModel: "", level: null };
+  const slash = value.indexOf("/");
+  const alias = slash === -1 ? "" : value.slice(0, slash);
+  const rest = slash === -1 ? value : value.slice(slash + 1);
+  const m = rest.match(/^(.*)\(([^()]+)\)\s*$/);
+  return m
+    ? { alias, baseModel: m[1].trim(), level: m[2].trim().toLowerCase() }
+    : { alias, baseModel: rest.trim(), level: null };
+}
+
+// Rewrite a member string with a new thinking level ("" clears the suffix).
+function withThinkingLevel(value, level) {
+  const { alias, baseModel } = parseMember(value);
+  const base = alias ? `${alias}/${baseModel}` : baseModel;
+  return level ? `${base}(${level})` : base;
+}
 
 // Capacity adapter: global fallback pools of models per input-modality capability.
 // A request needing a capability the target model/combo lacks switches straight
@@ -562,6 +586,12 @@ function ModelItem({ id, index, model, isFirst, isLast, onEdit, onMoveUp, onMove
   };
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(model);
+  const { alias, baseModel, level } = parseMember(model);
+  const thinkingLevels = alias && baseModel ? getThinkingLevels(resolveProviderAlias(alias), baseModel) : null;
+  // Show the current level even if it's outside the model's standard set (e.g. a raw budget).
+  const levelOptions = thinkingLevels
+    ? (level && !thinkingLevels.includes(level) ? [level, ...thinkingLevels] : thinkingLevels)
+    : null;
   const commit = () => {
     const trimmed = draft.trim();
     if (trimmed && trimmed !== model) onEdit(trimmed);
@@ -616,6 +646,22 @@ function ModelItem({ id, index, model, isFirst, isLast, onEdit, onMoveUp, onMove
         >
           {model}
         </div>
+      )}
+
+      {/* Per-model thinking level → rewrites the "(level)" suffix on this member */}
+      {levelOptions && !editing && (
+        <select
+          value={level || ""}
+          onChange={(e) => onEdit(withThinkingLevel(model, e.target.value))}
+          onClick={(e) => e.stopPropagation()}
+          title="Thinking level for this model"
+          className="shrink-0 rounded border border-black/10 bg-transparent px-1 py-0.5 font-mono text-[10px] text-text-muted outline-none hover:text-text-main dark:border-white/10 dark:bg-black/20"
+        >
+          <option value="">auto</option>
+          {levelOptions.map((lv) => (
+            <option key={lv} value={lv}>{lv}</option>
+          ))}
+        </select>
       )}
 
       {/* Priority arrows */}

@@ -58,6 +58,16 @@ const COOLDOWN = {
  */
 export const ERROR_RULES = [
   // --- Text-based rules (checked first, order = priority) ---
+  // Context-window overflow (input too large). Permanent request-level error, NOT a
+  // rate limit — retrying the same oversized body fails identically. cooldownMs: 0 so
+  // no account/model lock is applied: combos fall through to the next member, and solo
+  // requests surface the real error (e.g. 400) instead of a fake "reset after 30s".
+  { text: "range of input length",    cooldownMs: 0 },
+  { text: "exceeds the context window", cooldownMs: 0 },
+  { text: "maximum context length",   cooldownMs: 0 },
+  { text: "context_length_exceeded",  cooldownMs: 0 },
+  { text: "reduce the length",        cooldownMs: 0 },
+  { text: "prompt is too long",       cooldownMs: 0 },
   { text: "no credentials",           cooldownMs: COOLDOWN.long },
   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
   { text: "improperly formed request", cooldownMs: COOLDOWN.long },

@@ -15,6 +15,7 @@
  */
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
+import { estimateMessageStartInputTokens } from "../../utils/usageTracking.js";
 
 function stopThinkingBlock(state, results) {
   if (!state.thinkingBlockStarted) return;
@@ -95,7 +96,7 @@ export function kiroToClaudeResponse(chunk, state) {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage: { input_tokens: estimateMessageStartInputTokens(state), output_tokens: 0 },
       },
     });
   }

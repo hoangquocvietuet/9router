@@ -3,28 +3,7 @@ import { FORMATS } from "../formats.js";
 import { ROLE, CLAUDE_BLOCK, MODEL_FALLBACK } from "../schema/index.js";
 import { fromOpenAIFinish } from "../concerns/finishReason.js";
 import { extractReasoningText } from "../concerns/reasoning.js";
-import { estimateUsage } from "../../utils/usageTracking.js";
-
-// Prompt-token count to advertise in message_start. Claude Code reads its
-// context-bar % from message_start.usage.input_tokens and does NOT update it
-// from the later message_delta. For OpenAI-format upstreams the real prompt
-// count only arrives with the final chunk, so message_start would otherwise
-// carry 0 and the bar would sit at 0%. Estimate from the request body instead.
-// Cost tracking is unaffected: message_delta still carries the real usage.
-function messageStartInputTokens(state) {
-  // Real usage from a usage-bearing first chunk wins (rare for OpenAI streams).
-  if (state.usage && typeof state.usage.input_tokens === "number" && state.usage.input_tokens > 0) {
-    return state.usage.input_tokens;
-  }
-  // Otherwise estimate prompt tokens from the request body threaded via state.
-  if (state.body) {
-    const estimated = estimateUsage(state.body, 0, FORMATS.CLAUDE);
-    if (estimated && typeof estimated.input_tokens === "number" && estimated.input_tokens > 0) {
-      return estimated.input_tokens;
-    }
-  }
-  return 0;
-}
+import { estimateMessageStartInputTokens } from "../../utils/usageTracking.js";
 
 // Legacy "proxy_" prefix used by older request translators. Response strips it
 // defensively so tool names from such turns resolve back (e.g. proxy_Read → Read
@@ -152,7 +131,7 @@ export function openaiToClaudeResponse(chunk, state) {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: messageStartInputTokens(state), output_tokens: 0 }
+        usage: { input_tokens: estimateMessageStartInputTokens(state), output_tokens: 0 }
       }
     });
   }

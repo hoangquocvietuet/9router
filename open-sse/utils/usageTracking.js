@@ -399,6 +399,31 @@ export function estimateUsage(body, contentLength, targetFormat = FORMATS.OPENAI
 }
 
 /**
+ * Input-token count to advertise in message_start for X→claude response paths.
+ * Claude Code reads its context-bar % from message_start.usage.input_tokens and
+ * does NOT update it from the later message_delta. OpenAI-format upstreams only
+ * send real usage with the final chunk, so message_start would otherwise carry 0
+ * and the bar would sit at 0% (no client-side auto-compaction). Real usage from a
+ * usage-bearing first chunk wins; otherwise estimate from the request body
+ * (chars/4, monotonic with history). Cost tracking is unaffected: message_delta
+ * still carries the real usage.
+ * @param {object} state - Stream translator state (must expose .body and optionally .usage)
+ * @returns {number} input_tokens to advertise
+ */
+export function estimateMessageStartInputTokens(state) {
+  if (state?.usage && typeof state.usage.input_tokens === "number" && state.usage.input_tokens > 0) {
+    return state.usage.input_tokens;
+  }
+  if (state?.body) {
+    const estimated = estimateUsage(state.body, 0, FORMATS.CLAUDE);
+    if (estimated && typeof estimated.input_tokens === "number" && estimated.input_tokens > 0) {
+      return estimated.input_tokens;
+    }
+  }
+  return 0;
+}
+
+/**
  * Log usage with cache info (green color)
  */
 export function logUsage(provider, usage, model = null, connectionId = null, apiKey = null) {

@@ -25,6 +25,15 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
 
+// Context-window overflow reported inside a 200-OK SSE body (event: error / response.failed).
+// Not retryable and not account-specific — must fall through to the next combo member.
+const CODEX_SSE_CONTEXT_OVERFLOW_PATTERNS = [
+  "exceeds the context window",
+  "maximum context length",
+  "context_length_exceeded",
+  "reduce the length",
+];
+
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
 
@@ -291,6 +300,11 @@ export class CodexExecutor extends BaseExecutor {
         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || CODEX_MODEL_CAPACITY_MESSAGE);
         return result;
       }
+      if (peek.contextOverflow) {
+        args.log?.warn?.("RETRY", `CODEX | SSE context overflow "${peek.message}" — falling through to next combo member`);
+        result.response = codexSseErrorResponse(HTTP_STATUS.BAD_REQUEST, peek.message || peek.matched);
+        return result;
+      }
       if (attempt >= attempts) {
         args.log?.warn?.("RETRY", `CODEX | SSE overloaded "${peek.matched}" — retries exhausted (${attempt}/${attempts})`);
         result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || peek.matched);
@@ -304,16 +318,17 @@ export class CodexExecutor extends BaseExecutor {
   }
 
   // Peek first N bytes of SSE body to detect upstream transient errors.
-  // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
+  // Returns { matched: string|null, message: string|null, accountFallback: boolean, contextOverflow: boolean, replacementBody: ReadableStream|null }.
   // Caller must use replacementBody when no error matched (original body has been read).
   async _peekSseTransientError(response) {
-    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
+    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, contextOverflow: false, replacementBody: null };
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks = [];
     let text = "";
     let matched = null;
     let accountFallback = false;
+    let contextOverflow = false;
     try {
       while (text.length < CODEX_SSE_PEEK_BYTES) {
         const { done, value } = await reader.read();
@@ -325,6 +340,8 @@ export class CodexExecutor extends BaseExecutor {
         if (accountHit) { matched = accountHit; accountFallback = true; break; }
         const retryHit = CODEX_SSE_RETRY_PATTERNS.find(p => lowerText.includes(p));
         if (retryHit) { matched = retryHit; break; }
+        const overflowHit = CODEX_SSE_CONTEXT_OVERFLOW_PATTERNS.find(p => lowerText.includes(p));
+        if (overflowHit) { matched = overflowHit; contextOverflow = true; break; }
         if (CODEX_SSE_USER_OUTPUT_PATTERNS.some(p => lowerText.includes(p))) break;
       }
     } catch (e) {
@@ -334,7 +351,7 @@ export class CodexExecutor extends BaseExecutor {
     if (matched) {
       try { await reader.cancel(); } catch { /* noop */ }
       try { reader.releaseLock(); } catch { /* noop */ }
-      return { matched, message: extractSseErrorMessage(text, matched), accountFallback, replacementBody: null };
+      return { matched, message: extractSseErrorMessage(text, matched), accountFallback, contextOverflow, replacementBody: null };
     }
 
     reader.releaseLock();
@@ -358,7 +375,7 @@ export class CodexExecutor extends BaseExecutor {
         try { upstreamReader?.cancel(reason); } catch { /* noop */ }
       },
     });
-    return { matched: null, message: null, accountFallback: false, replacementBody };
+    return { matched: null, message: null, accountFallback: false, contextOverflow: false, replacementBody };
   }
 
   // Parse Codex usage_limit_reached to extract precise resetsAtMs; fallback to default otherwise

@@ -83,9 +83,33 @@ export async function getModelInfo(modelStr) {
  * @returns {Promise<string[]|null>} Array of models or null if not a combo
  */
 export async function getComboModels(modelStr) {
-  // Only check if it's not in provider/model format
-  if (modelStr.includes("/")) return null;
+  const resolved = await resolveCombo(modelStr);
+  return resolved ? resolved.models : null;
+}
 
+/**
+ * Resolve a request model string to the underlying combo NAME (following a single
+ * hop alias), or null if it is not a combo. Combo-keyed settings (comboStrategies,
+ * fusion judge/tuning) are stored under the combo's real name, so this is what
+ * callers must key them by even when the combo is addressed via a façade alias
+ * like "claude-opus-4-8[1m]" → "master".
+ * @returns {Promise<string|null>}
+ */
+export async function getComboName(modelStr) {
+  const resolved = await resolveCombo(modelStr);
+  return resolved ? resolved.name : null;
+}
+
+/**
+ * Shared combo resolver. Returns { name, models } for a combo (resolving a bare
+ * combo name or a single-hop alias whose target is a bare combo name), or null.
+ * @returns {Promise<{name: string, models: string[]}|null>}
+ */
+async function resolveCombo(modelStr) {
+  // Only check if it's not in provider/model format
+  if (!modelStr || modelStr.includes("/")) return null;
+
+  let name = modelStr;
   let combo = await getComboByName(modelStr);
   if (!combo) {
     // A model alias may point at a combo name (e.g. "claude-opus-4-8[1m]" → "master").
@@ -96,11 +120,12 @@ export async function getComboModels(modelStr) {
     const aliases = await getModelAliases();
     const target = aliases?.[modelStr];
     if (typeof target === "string" && target && !target.includes("/")) {
+      name = target;
       combo = await getComboByName(target);
     }
   }
   if (combo && combo.models && combo.models.length > 0) {
-    return combo.models;
+    return { name, models: combo.models };
   }
   return null;
 }

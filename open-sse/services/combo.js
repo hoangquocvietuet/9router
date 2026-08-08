@@ -6,6 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { estimateInputTokens } from "../utils/usageTracking.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -243,6 +244,13 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
  * @returns {Promise<Response>}
  */
+function getModelContextWindow(modelStr) {
+  const slash = typeof modelStr === "string" ? modelStr.indexOf("/") : -1;
+  const provider = slash > 0 ? modelStr.slice(0, slash) : "";
+  const model = slash > 0 ? modelStr.slice(slash + 1) : modelStr;
+  return getCapabilitiesForModel(provider, model)?.contextWindow || 0;
+}
+
 export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
@@ -258,7 +266,26 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       rotatedModels = reordered;
     }
   }
-  
+
+  // Capability-aware context-window filtering. Skip combo members whose real
+  // context window is smaller than the estimated prompt size. This prevents
+  // sending 1M-token requests to Kimi (262K) and getting a hard 400.
+  const estimatedInputTokens = estimateInputTokens(body);
+  const viableModels = [];
+  for (const modelStr of rotatedModels) {
+    const ctx = getModelContextWindow(modelStr);
+    if (ctx > 0 && estimatedInputTokens > ctx) {
+      log.info("COMBO", `Skipping ${modelStr}: estimated prompt ${estimatedInputTokens} exceeds context window ${ctx}`);
+      continue;
+    }
+    viableModels.push(modelStr);
+  }
+  if (viableModels.length === 0) {
+    log.warn("COMBO", `No combo member can fit estimated prompt ${estimatedInputTokens} tokens`);
+    return unavailableResponse(400, "No combo model has a context window large enough for this request");
+  }
+  rotatedModels = viableModels;
+
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;

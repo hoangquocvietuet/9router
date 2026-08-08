@@ -68,4 +68,51 @@ describe("OpenCode Go endpoint routing", () => {
       expect(headers["anthropic-version"]).toBeUndefined();
     }
   });
+
+  it("sanitizes Moonshot-incompatible anyOf tool schemas for chat/completions models", () => {
+    const executor = new OpenCodeGoExecutor();
+    const body = {
+      model: "kimi-k2.7-code",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "linear_issue_update",
+          description: "Update a Linear issue",
+          parameters: {
+            type: "object",
+            properties: {
+              add_label_ids: {
+                type: "array",
+                anyOf: [
+                  { type: "array", items: { type: "string" } },
+                  { type: "null" }
+                ]
+              }
+            }
+          }
+        }
+      }]
+    };
+
+    const transformed = executor.transformRequest("kimi-k2.7-code", body);
+    const addLabel = transformed.tools[0].function.parameters.properties.add_label_ids;
+    expect(addLabel.anyOf).toBeUndefined();
+    expect(addLabel.type).toBe("array");
+    expect(addLabel.items).toEqual({ type: "string" });
+  });
+
+  it("does not sanitize tools for messages-format models", () => {
+    const executor = new OpenCodeGoExecutor();
+    const schema = {
+      type: "object",
+      properties: {
+        value: { type: "string", anyOf: [{ type: "string" }, { type: "null" }] }
+      }
+    };
+    const body = { model: "qwen3.7-max", messages: [], tools: [{ type: "function", function: { name: "t", parameters: schema } }] };
+
+    const transformed = executor.transformRequest("qwen3.7-max", body);
+    expect(transformed.tools[0].function.parameters.properties.value.anyOf).toBeDefined();
+  });
 });

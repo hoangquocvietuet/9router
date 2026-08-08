@@ -203,4 +203,47 @@ describe("openaiToClaudeResponse", () => {
       limit: 120
     });
   });
+
+  it("estimates message_start.input_tokens from body while message_delta keeps real usage", () => {
+    // Body threaded via state (as stream.js does) so the client context bar is
+    // non-zero even though the OpenAI-format upstream only sends usage at finish.
+    const body = {
+      messages: [{ role: "user", content: "x".repeat(4000) }],
+      system: "You are a helpful assistant."
+    };
+    const state = { toolCalls: new Map(), body };
+
+    // First chunk (no usage yet) → message_start must carry an estimate > 0.
+    const firstChunk = {
+      id: "chatcmpl-abc",
+      model: "gpt-test",
+      choices: [{ delta: { content: "Hi" } }]
+    };
+    const firstEvents = openaiToClaudeResponse(firstChunk, state);
+    const messageStart = firstEvents.find(e => e.type === "message_start");
+
+    expect(messageStart).toBeDefined();
+    expect(messageStart.message.usage.input_tokens).toBeGreaterThan(0);
+    // Cache fields stay absent on message_start.
+    expect(messageStart.message.usage.cache_read_input_tokens).toBeUndefined();
+    expect(messageStart.message.usage.cache_creation_input_tokens).toBeUndefined();
+
+    const estimatedInput = messageStart.message.usage.input_tokens;
+
+    // Final chunk carries real usage → message_delta must reflect it, unchanged.
+    const finishChunk = {
+      id: "chatcmpl-abc",
+      model: "gpt-test",
+      choices: [{ delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 123, completion_tokens: 45 }
+    };
+    const finishEvents = openaiToClaudeResponse(finishChunk, state);
+    const messageDelta = finishEvents.find(e => e.type === "message_delta");
+
+    expect(messageDelta).toBeDefined();
+    expect(messageDelta.usage.input_tokens).toBe(123);
+    expect(messageDelta.usage.output_tokens).toBe(45);
+    // The real count must NOT be the message_start estimate.
+    expect(messageDelta.usage.input_tokens).not.toBe(estimatedInput);
+  });
 });

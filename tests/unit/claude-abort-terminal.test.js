@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createDisconnectAwareStream } from "../../open-sse/utils/streamHandler.js";
 import { buildAbortedClaudeTerminalBytes } from "../../open-sse/utils/claudeStreamHelpers.js";
@@ -123,5 +123,108 @@ describe("Claude abort terminal synthesis", () => {
     const text = await readAll(out);
     // Exactly one message_stop — the real one, no synthesized duplicate
     expect(text.match(/event: message_stop/g)?.length).toBe(1);
+  });
+});
+
+describe("synthesized terminal diagnostics", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("logs reason=eof with streamMeta when upstream closes empty", async () => {
+    const warnings = [];
+    vi.spyOn(console, "warn").mockImplementation((msg) => warnings.push(msg));
+
+    const upstream = new ReadableStream({
+      start(controller) { controller.close(); },
+    });
+
+    const out = createDisconnectAwareStream(
+      { readable: upstream, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+      makeController(),
+      buildAbortedClaudeTerminalBytes,
+      null,
+      { provider: "codex", model: "gpt-test", requestTag: "req-test" }
+    );
+
+    await readAll(out);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("[STREAM] synthesized terminal");
+    expect(warnings[0]).toContain("reason=eof");
+    expect(warnings[0]).toContain("provider=codex");
+    expect(warnings[0]).toContain("model=gpt-test");
+    expect(warnings[0]).toContain("request=req-test");
+    expect(warnings[0]).toContain("chunks=0");
+    expect(warnings[0]).toContain("events=0");
+  });
+
+  it("logs reason=error with streamMeta when upstream errors", async () => {
+    const warnings = [];
+    vi.spyOn(console, "warn").mockImplementation((msg) => warnings.push(msg));
+
+    const upstream = new ReadableStream({
+      start(controller) { controller.error(new Error("terminated")); },
+    });
+
+    const out = createDisconnectAwareStream(
+      { readable: upstream, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+      makeController(),
+      buildAbortedClaudeTerminalBytes,
+      null,
+      { provider: "anthropic", model: "claude-test", requestTag: "req-err" }
+    );
+
+    await readAll(out).catch(() => {});
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("[STREAM] synthesized terminal");
+    expect(warnings[0]).toContain("reason=error");
+    expect(warnings[0]).toContain("provider=anthropic");
+    expect(warnings[0]).toContain("model=claude-test");
+    expect(warnings[0]).toContain("request=req-err");
+  });
+
+  it("does NOT log when real message_stop arrives", async () => {
+    const warnings = [];
+    vi.spyOn(console, "warn").mockImplementation((msg) => warnings.push(msg));
+
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
+        controller.enqueue(new TextEncoder().encode("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        controller.close();
+      },
+    });
+
+    const out = createDisconnectAwareStream(
+      { readable: upstream, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+      makeController(),
+      buildAbortedClaudeTerminalBytes,
+      null,
+      { provider: "codex", model: "gpt-test", requestTag: "req-ok" }
+    );
+
+    await readAll(out);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it("uses 'unknown' fallback when streamMeta is absent", async () => {
+    const warnings = [];
+    vi.spyOn(console, "warn").mockImplementation((msg) => warnings.push(msg));
+
+    const upstream = new ReadableStream({
+      start(controller) { controller.close(); },
+    });
+
+    const out = createDisconnectAwareStream(
+      { readable: upstream, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+      makeController(),
+      buildAbortedClaudeTerminalBytes
+    );
+
+    await readAll(out);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("provider=unknown");
+    expect(warnings[0]).toContain("model=unknown");
+    expect(warnings[0]).toContain("request=unknown");
   });
 });

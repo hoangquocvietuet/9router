@@ -96,7 +96,7 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
       ? buildAbortedClaudeTerminalBytes
       : null;
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
+  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, { provider, model, requestTag: reqTag });
 
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,

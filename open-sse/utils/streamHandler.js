@@ -105,7 +105,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
 // marker is never split across the chunks read here.
 const STREAM_TERMINAL_MARKERS = ["event: message_stop", "data: [DONE]"];
 
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, pipeStats = null) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, pipeStats = null, streamMeta = null) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
@@ -115,7 +115,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
 
   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE],
   // or a Claude error message_delta + message_stop) once.
-  const emitTerminal = (controller) => {
+  const emitTerminal = (controller, reason) => {
     if (terminalEmitted || !onAbortTerminal) return;
     terminalEmitted = true;
     if (pipeStats) {
@@ -126,12 +126,15 @@ export function createDisconnectAwareStream(transformStream, streamController, o
       const bytes = onAbortTerminal();
       if (bytes) controller.enqueue(bytes);
     } catch { /* best-effort terminal */ }
+    console.warn(
+      `[STREAM] synthesized terminal | reason=${reason} | provider=${streamMeta?.provider || "unknown"} | model=${streamMeta?.model || "unknown"} | request=${streamMeta?.requestTag || "unknown"} | chunks=${pipeStats?.upstreamChunks || 0} bytes=${pipeStats?.upstreamBytes || 0} events=${pipeStats?.emittedChunks || 0}`
+    );
   };
 
   return new ReadableStream({
     async pull(controller) {
       if (!streamController.isConnected()) {
-        if (!sawRealTerminal) emitTerminal(controller);
+        if (!sawRealTerminal) emitTerminal(controller, "disconnect");
         controller.close();
         return;
       }
@@ -146,7 +149,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
           // message_stop). Synthesize a terminal so the client sees a real
           // end-of-stream (or error) instead of an empty/incomplete body
           // committed as HTTP 200.
-          if (!sawRealTerminal) emitTerminal(controller);
+          if (!sawRealTerminal) emitTerminal(controller, "eof");
           streamController.handleComplete();
           controller.close();
           return;
@@ -190,7 +193,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
         //  Claude-target translation prefers error-shaped message_delta + message_stop.)
         try {
           if (!wasConnected || isNetworkClose || onAbortTerminal) {
-            if (!sawRealTerminal) emitTerminal(controller);
+            if (!sawRealTerminal) emitTerminal(controller, "error");
             controller.close();
           } else {
             controller.error(error);
@@ -223,7 +226,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, streamMeta = null) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
@@ -233,7 +236,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   // Shared with createDisconnectAwareStream so the DONE/error line can report
   // translated-event count + whether a terminal was synthesized. Missing TTFT +
   // zero translated events is the fingerprint of a truncated/empty-200 stream.
-  const pipeStats = { emittedChunks: 0, terminalEmitted: false, terminalSynthesized: false };
+  const pipeStats = { upstreamChunks: 0, upstreamBytes: 0, emittedChunks: 0, terminalEmitted: false, terminalSynthesized: false };
   const streamSummary = () =>
     `chunks=${chunkCount} bytes=${totalBytes} events=${pipeStats.emittedChunks} terminal=${pipeStats.terminalEmitted} terminalSynth=${pipeStats.terminalSynthesized} dur=${Date.now() - t0}ms`;
   const clearStall = () => {
@@ -270,6 +273,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
       chunkCount++;
       const sz = chunk?.byteLength || chunk?.length || 0;
       totalBytes += sz;
+      pipeStats.upstreamChunks = chunkCount;
+      pipeStats.upstreamBytes = totalBytes;
       const now = Date.now();
       const gap = now - lastChunkAt;
       lastChunkAt = now;
@@ -290,7 +295,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
     onAbortTerminal,
-    pipeStats
+    pipeStats,
+    streamMeta
   );
 }
 

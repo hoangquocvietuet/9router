@@ -1,6 +1,6 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
-import { ROLE, CLAUDE_BLOCK, MODEL_FALLBACK } from "../schema/index.js";
+import { ROLE, CLAUDE_BLOCK, MODEL_FALLBACK, OPENAI_FINISH, CLAUDE_STOP } from "../schema/index.js";
 import { fromOpenAIFinish } from "../concerns/finishReason.js";
 import { extractReasoningText } from "../concerns/reasoning.js";
 import { estimateMessageStartInputTokens } from "../../utils/usageTracking.js";
@@ -68,9 +68,61 @@ function stopTextBlock(state, results) {
   state.textBlockStarted = false;
 }
 
+// Helper: close every open tool_use block, flushing its buffered + sanitized
+// arguments as a single input_json_delta first (mirrors what the request stream
+// buffers per idx). Shared by the finish path and the defensive flush so a
+// stream that closes without finish_reason does not drop tool arguments and
+// emit a tool_use block with empty input.
+function stopToolBlocks(state, results) {
+  for (const [idx, toolInfo] of state.toolCalls) {
+    const buffered = state.toolArgBuffers?.get(idx);
+    if (buffered) {
+      results.push({
+        type: "content_block_delta",
+        index: toolInfo.blockIndex,
+        delta: { type: "input_json_delta", partial_json: sanitizeToolArgs(toolInfo.name, buffered) }
+      });
+    }
+    results.push({
+      type: "content_block_stop",
+      index: toolInfo.blockIndex
+    });
+  }
+}
+
+// Normalize whatever shape state.usage currently holds into Claude usage.
+// Two writers populate state.usage: openaiToClaudeResponse (Claude-shaped, from
+// a chunk that has choices[0]) and stream.js's extractUsage/mergeUsage
+// (OpenAI-shaped, from a usage-only choices:[] trailing chunk that returns early
+// here). At flush the OpenAI-shaped variant can be the live value, so a raw
+// pass-through would emit prompt_tokens/completion_tokens that filterUsageForFormat
+// then strips to {}. Convert defensively.
+function toClaudeUsage(u) {
+  if (!u || typeof u !== "object") return { input_tokens: 0, output_tokens: 0 };
+  // Already Claude-shaped.
+  if (typeof u.input_tokens === "number" || typeof u.output_tokens === "number") {
+    const out = { input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0 };
+    if (u.cache_read_input_tokens) out.cache_read_input_tokens = u.cache_read_input_tokens;
+    if (u.cache_creation_input_tokens) out.cache_creation_input_tokens = u.cache_creation_input_tokens;
+    return out;
+  }
+  // OpenAI-shaped → convert (mirrors the extraction at the top of openaiToClaudeResponse).
+  const prompt = typeof u.prompt_tokens === "number" ? u.prompt_tokens : 0;
+  const cacheRead = u.prompt_tokens_details?.cached_tokens || 0;
+  const cacheCreate = u.prompt_tokens_details?.cache_creation_tokens || 0;
+  const out = { input_tokens: prompt - cacheRead - cacheCreate, output_tokens: u.completion_tokens || 0 };
+  if (cacheRead) out.cache_read_input_tokens = cacheRead;
+  if (cacheCreate) out.cache_creation_input_tokens = cacheCreate;
+  return out;
+}
+
 // Convert OpenAI stream chunk to Claude format
 export function openaiToClaudeResponse(chunk, state) {
-  if (!chunk || !chunk.choices?.[0]) return null;
+  // chunk === null/undefined is the flush signal from stream.js (upstream EOF).
+  if (chunk == null) return openaiToClaudeFlush(state);
+  // Usage-only trailing chunk (choices:[]). stream.js already captured its usage
+  // via extractUsage before translating; nothing to emit here.
+  if (!chunk.choices?.[0]) return null;
 
   const results = [];
   const choice = chunk.choices[0];
@@ -226,29 +278,17 @@ export function openaiToClaudeResponse(chunk, state) {
   if (choice.finish_reason) {
     stopThinkingBlock(state, results);
     stopTextBlock(state, results);
-
-    for (const [idx, toolInfo] of state.toolCalls) {
-      // Emit buffered + sanitized args as single delta before stop
-      const buffered = state.toolArgBuffers?.get(idx);
-      if (buffered) {
-        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
-        results.push({
-          type: "content_block_delta",
-          index: toolInfo.blockIndex,
-          delta: { type: "input_json_delta", partial_json: sanitized }
-        });
-      }
-      results.push({
-        type: "content_block_stop",
-        index: toolInfo.blockIndex
-      });
-    }
+    stopToolBlocks(state, results);
 
     // Mark finish for later usage injection in stream.js
     state.finishReason = choice.finish_reason;
 
-    // Use tracked usage (will be estimated in stream.js if not valid)
-    const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
+    // Use tracked usage (will be estimated in stream.js if not valid).
+    // Normalize to Claude shape — state.usage may have been written by
+    // stream.js's extractUsage from a usage-only trailing chunk (OpenAI-shaped)
+    // and never converted by the top-of-function code path that only runs for
+    // chunks with choices[0].
+    const finalUsage = toClaudeUsage(state.usage);
     results.push({
       type: "message_delta",
       delta: { stop_reason: convertFinishReason(choice.finish_reason) },
@@ -257,6 +297,36 @@ export function openaiToClaudeResponse(chunk, state) {
     results.push({ type: "message_stop" });
   }
 
+  return results.length > 0 ? results : null;
+}
+
+// Defensive flush: emit message_stop when the upstream stream ended cleanly
+// (chunk=null, flush call) but never sent a finish_reason.
+//
+// Some providers (e.g. opencode-go/gpt-5.6-luna) close their SSE stream after
+// content and usage-only chunks without emitting a finish_reason or [DONE].
+// Without this, the translator emits no message_stop → sawRealTerminal stays
+// false → createDisconnectAwareStream synthesize an error terminal, and the
+// client sees "API Error: Server error mid-response" despite a complete response.
+//
+// Guard: only fire when message_start was sent (stream actually started).
+// A stream that received no content at all (messageStartSent=false) gets no
+// defensive terminal — the upstream-level synthesized terminal handles that.
+export function openaiToClaudeFlush(state) {
+  if (state.finishReason || !state.messageStartSent) return null;
+
+  const results = [];
+  stopThinkingBlock(state, results);
+  stopTextBlock(state, results);
+  stopToolBlocks(state, results);
+
+  state.finishReason = OPENAI_FINISH.STOP;
+  results.push({
+    type: "message_delta",
+    delta: { stop_reason: CLAUDE_STOP.END_TURN },
+    usage: toClaudeUsage(state.usage),
+  });
+  results.push({ type: "message_stop" });
   return results.length > 0 ? results : null;
 }
 

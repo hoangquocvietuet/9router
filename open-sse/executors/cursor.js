@@ -7,7 +7,11 @@ import {
   wrapConnectRPCFrame,
   decodeMessage,
   parseConnectRPCFrame,
-  extractTextFromResponse
+  extractTextFromResponse,
+  encodeMcpTools,
+  encodeMcpResultError,
+  encodeMcpResultToolNotFound,
+  decodeMcpArgs,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { estimateUsage } from "../utils/usageTracking.js";
@@ -70,32 +74,56 @@ function textFromContent(content) {
     .join("\n");
 }
 
-function isAgentTextRequest(body) {
-  // Many compatible clients always attach their built-in tool schemas, even
-  // for a normal text turn. Cursor's retired ChatService rejects those
-  // requests; AgentService can still answer the text turn, so ignore schemas
-  // here. A real tool-call/result conversation is kept on the legacy path
-  // until its AgentService tool protocol is implemented.
-  return Array.isArray(body?.messages) && body.messages.every((message) => {
-    if (message?.tool_calls?.length || message?.role === "tool") return false;
-    return typeof message?.content === "string"
-      || Array.isArray(message?.content) && message.content.every((part) => part?.type === "text");
+export function isAgentCapableRequest(body) {
+  // The AgentService handler can service every request whose messages are
+  // text-only: plain strings or text-part arrays. Conversations that carry
+  // tool history are routed through AgentService as well — its exec_request
+  // protocol carries the tool declarations and tool results. Non-text
+  // content (image, audio, file parts) still falls back to legacy paths
+  // elsewhere.
+  return Array.isArray(body?.messages) && body.messages.length > 0 && body.messages.every((message) => {
+    if (!message || typeof message !== "object") return false;
+    const content = message.content;
+    if (typeof content === "string") return true;
+    if (Array.isArray(content)) return content.every((part) => part?.type === "text" && typeof part.text === "string");
+    if (content === null || content === undefined) return true; // tool-call markers carry no content
+    return false;
   });
 }
 
+// Back-compat alias kept for callers that still reference the old name.
+export const isAgentTextRequest = isAgentCapableRequest;
+
+function toolHistoryText(message) {
+  if (message?.role === "tool") {
+    const content = textFromContent(message.content);
+    return `Tool result${message.tool_call_id ? ` (${message.tool_call_id})` : ""}: ${content}`;
+  }
+
+  if (message?.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+    return message.tool_calls.map((call) => {
+      const name = call?.function?.name || "unknown";
+      const args = call?.function?.arguments || "{}";
+      return `Tool call (${call?.id || ""}): ${name}(${args})`;
+    }).join("\n");
+  }
+
+  return textFromContent(message?.content);
+}
+
 function encodeHistoryMessage(message) {
-  const content = textFromContent(message?.content);
+  const content = toolHistoryText(message);
   if (!content) return null;
 
   // ConversationHistoryMessage.user / .assistant -> repeated content -> text.
   const text = agentString(1, content);
-  if (message.role === "assistant") {
+  if (message.role === "assistant" || message.role === "tool") {
     return agentMessage(2, agentMessage(1, agentMessage(1, text)));
   }
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
 }
 
-function buildAgentRunFrame(messages, model) {
+export function buildAgentRunFrame(messages, model, tools = []) {
   const system = messages
     .filter((message) => message?.role === "system")
     .map((message) => textFromContent(message.content))
@@ -124,10 +152,12 @@ function buildAgentRunFrame(messages, model) {
   );
   const conversationAction = agentMessage(1, userAction);
   const requestedModel = concatBuffers(agentString(1, model), agentBool(7, true));
+  const mcpTools = tools?.length ? encodeMcpTools(tools) : null;
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
     agentMessage(1, new Uint8Array()),
     agentMessage(2, conversationAction),
+    ...(mcpTools ? [agentMessage(4, mcpTools)] : []),
     ...(system ? [agentString(8, system)] : []),
     agentMessage(9, requestedModel),
   );
@@ -493,7 +523,7 @@ export class CursorExecutor extends BaseExecutor {
     let session;
     try {
       session = this.openAgentHttp2Stream(url, headers, requestController.signal);
-      session.write(buildAgentRunFrame(body.messages || [], model));
+      session.write(buildAgentRunFrame(body.messages || [], model, body.tools || []));
     } catch (error) {
       throw new Error(`Cursor AgentService request failed: ${error.message}`);
     }
@@ -572,6 +602,32 @@ export class CursorExecutor extends BaseExecutor {
               const execRequest = decodeMessage(serverMessage.get(2)[0].value);
               if (execRequest.has(10)) {
                 session.write(createRequestContextResponse());
+              } else if (execRequest.has(2)) {
+                // agent.v1.ExecServerMessage.mcp_tool (field 2) — reply with a
+                // toolNotFound / error result so the agent loop continues.
+                // 9router does not host any MCP servers of its own, so any
+                // declared tool is treated as "not implemented" rather than
+                // letting the request stall the stream.
+                const argsBuffer = execRequest.get(2)[0]?.value || new Uint8Array();
+                let mcpArgs;
+                try { mcpArgs = decodeMcpArgs(argsBuffer); } catch { mcpArgs = null; }
+                const toolName = mcpArgs?.toolName || mcpArgs?.name;
+                if (toolName) {
+                  const declaredNames = new Set(
+                    (body?.tools || []).map((tool) => tool?.function?.name || tool?.name).filter(Boolean)
+                  );
+                  const reply = declaredNames.size && declaredNames.has(toolName)
+                    ? encodeMcpResultError("Tool execution is not supported by this gateway")
+                    : encodeMcpResultToolNotFound(toolName);
+                  const execClientMessage = concatBuffers(
+                    agentMessage(2, reply),
+                    mcpArgs?.toolCallId ? agentString(3, mcpArgs.toolCallId) : new Uint8Array(),
+                  );
+                  session.write(wrapConnectRPCFrame(agentMessage(2, execClientMessage)));
+                } else {
+                  finished = true;
+                  onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
+                }
               } else {
                 // Every other ExecServerMessage variant is an editor-backed tool
                 // (shell, read, write, …) that 9router cannot service. Fail the
@@ -664,7 +720,7 @@ export class CursorExecutor extends BaseExecutor {
   }
 
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    if (isAgentTextRequest(body)) {
+    if (isAgentCapableRequest(body)) {
       try {
         return await this.executeAgent({ model, body, stream, credentials, signal });
       } catch (error) {

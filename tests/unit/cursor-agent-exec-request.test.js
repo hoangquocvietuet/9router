@@ -1,13 +1,28 @@
 import { describe, it, expect } from "vitest";
 
 import { CursorExecutor } from "../../open-sse/executors/cursor.js";
-import { encodeField, wrapConnectRPCFrame } from "../../open-sse/utils/cursorProtobuf.js";
+import {
+  decodeMessage,
+  encodeField,
+  parseConnectRPCFrame,
+  wrapConnectRPCFrame,
+} from "../../open-sse/utils/cursorProtobuf.js";
 
 const LEN = 2;
 
 // agent.v1.AgentServerMessage.exec_request (field 2) carrying one ExecServerMessage variant.
 function execRequestFrame(execField) {
   const execServerMessage = Buffer.from(encodeField(execField, LEN, new Uint8Array()));
+  return Buffer.from(wrapConnectRPCFrame(encodeField(2, LEN, execServerMessage)));
+}
+
+function mcpToolRequestFrame(name, toolCallId) {
+  const mcpArgs = Buffer.concat([
+    Buffer.from(encodeField(1, LEN, name)),
+    Buffer.from(encodeField(3, LEN, toolCallId)),
+    Buffer.from(encodeField(5, LEN, name)),
+  ]);
+  const execServerMessage = Buffer.from(encodeField(2, LEN, mcpArgs));
   return Buffer.from(wrapConnectRPCFrame(encodeField(2, LEN, execServerMessage)));
 }
 
@@ -48,12 +63,12 @@ function parseSSE(text) {
     .map((data) => JSON.parse(data));
 }
 
-async function runAgent({ frames, stream }) {
+async function runAgent({ frames, stream, tools = [] }) {
   const executor = new CursorExecutor();
   const written = stubAgentSession(executor, frames);
   const result = await executor.executeAgent({
     model: "gpt-5.2",
-    body: { messages: [{ role: "user", content: "hi" }] },
+    body: { messages: [{ role: "user", content: "hi" }], tools },
     stream,
     credentials,
   });
@@ -71,6 +86,36 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     const events = parseSSE(await result.response.text());
     const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
     expect(content).toBe("hello");
+  });
+
+  it("replies to an MCP tool request with a protocol tool-not-found result", async () => {
+    const { result, written } = await runAgent({
+      frames: [mcpToolRequestFrame("not_declared", "call_1"), textFrame("hello")],
+      stream: true,
+    });
+
+    expect(written.length).toBe(2); // run frame + MCP tool result
+    const responseFrame = parseConnectRPCFrame(written[1]);
+    const clientMessage = decodeMessage(responseFrame.payload);
+    const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
+    const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
+    expect(resultMessage.has(5)).toBe(true); // McpResult.tool_not_found
+    expect(await result.response.text()).toContain("hello");
+  });
+
+  it("replies with an MCP error for a declared tool", async () => {
+    const { result, written } = await runAgent({
+      frames: [mcpToolRequestFrame("declared_tool", "call_1"), textFrame("hello")],
+      stream: true,
+      tools: [{ type: "function", function: { name: "declared_tool" } }],
+    });
+
+    const responseFrame = parseConnectRPCFrame(written[1]);
+    const clientMessage = decodeMessage(responseFrame.payload);
+    const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
+    const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
+    expect(resultMessage.has(2)).toBe(true); // McpResult.error
+    expect(await result.response.text()).toContain("hello");
   });
 
   it("does not render an unsupported exec request as assistant content", async () => {

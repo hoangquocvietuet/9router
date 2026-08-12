@@ -249,7 +249,7 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       expect(run.has(9)).toBe(true); // requested_model
     });
 
-    it("omits mcp_tools and encodes tool declarations as user message text", () => {
+    it("encodes mcp_tools from Claude/OpenAI tool declarations", () => {
       const tools = [{ function: { name: "get_weather", description: "weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }];
       const normalized = normalizeAgentServiceRequest({
         messages: [{ role: "user", content: "weather?" }],
@@ -257,11 +257,14 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       });
       expect(normalized.tools).toEqual([]);
       expect(normalized.messages[0].content).toContain("weather?");
-      expect(normalized.messages[0].content).toContain("Available tools:");
-      expect(normalized.messages[0].content).toContain("get_weather");
-      const frame = unwrap(buildAgentRunFrame(normalized.messages, "gpt-5.2"));
+      expect(normalized.messages[0].content).not.toContain("Available tools:");
+      const frame = unwrap(buildAgentRunFrame(normalized.messages, "gpt-5.2", tools));
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
-      expect(run.has(4)).toBe(false); // mcp_tools omitted — tools are text-only
+      expect(run.has(4)).toBe(true); // mcp_tools
+      const mcp = decodeMessage(run.get(4)[0].value);
+      expect(mcp.get(1).length).toBe(1);
+      const def = decodeMessage(mcp.get(1)[0].value);
+      expect(Buffer.from(def.get(1)[0].value).toString("utf8")).toBe("get_weather");
     });
 
     it("omits mcp_tools when no tools provided", () => {
@@ -270,7 +273,7 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       expect(run.has(4)).toBe(false);
     });
 
-    it("encodes conversation_history from prior turns including tool calls/results as text", () => {
+    it("folds prior tool turns into the current user text so the original task survives", () => {
       const messages = [
         { role: "user", content: "weather in Tokyo?" },
         { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "get_weather", arguments: '{"city":"Tokyo"}' } }] },
@@ -284,9 +287,12 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
       const action = decodeMessage(run.get(2)[0].value);
       const userAction = decodeMessage(action.get(1)[0].value);
-      expect(userAction.has(7)).toBe(true); // conversation_history (field 7)
-      const history = decodeMessage(userAction.get(7)[0].value);
-      expect(history.get(1).length).toBeGreaterThanOrEqual(2); // prior turns
+      // conversation_history protobuf is intentionally unused; history is inlined.
+      expect(userAction.has(7)).toBe(false);
+      const userMessage = decodeMessage(userAction.get(1)[0].value);
+      const userText = Buffer.from(userMessage.get(1)[0].value).toString("utf8");
+      expect(userText).toContain("weather in Tokyo?");
+      expect(userText).toContain("thanks");
     });
   });
 });

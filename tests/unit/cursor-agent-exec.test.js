@@ -33,4 +33,25 @@ describe("cursorAgentExec", () => {
     expect(execClientMessage.has(7)).toBe(true);
     expect(extractExecMeta(execClientMessage)).toEqual({ id: 7, execId: "exec-read" });
   });
+
+  it("replies to shell_stream_args with shell_stream exit on field 14", () => {
+    const written = [];
+    const execRequest = decodeMessage(Buffer.concat([
+      Buffer.from(encodeField(1, 0, 9)),
+      Buffer.from(encodeField(15, LEN, "exec-shell-stream")),
+      Buffer.from(encodeField(14, LEN, Buffer.concat([
+        Buffer.from(encodeField(1, LEN, "ls -la")),
+        Buffer.from(encodeField(2, LEN, "/root/personal-projects")),
+      ]))),
+    ]));
+    const kind = handleAgentExecRequest(execRequest, { write: (f) => written.push(Buffer.from(f)) }, { buildSimulatedToolResult });
+    expect(kind).toBe("shellStream");
+    expect(written.length).toBeGreaterThanOrEqual(4);
+    const frame = parseConnectRPCFrame(written[0]);
+    const clientMessage = decodeMessage(frame.payload);
+    const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
+    expect(execClientMessage.has(14)).toBe(true);
+    const shellStream = decodeMessage(execClientMessage.get(14)[0].value);
+    expect(shellStream.has(4)).toBe(true);
+  });
 });

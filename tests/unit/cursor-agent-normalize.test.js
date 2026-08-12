@@ -41,8 +41,9 @@ describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
     expect(normalized.messages.some((m) => m.content?.includes("User has used these tools"))).toBe(true);
     expect(normalized.messages.some((m) => m.content?.includes("paseo/browser_snapshot"))).toBe(true);
     expect(normalized.messages.some((m) => m.content?.includes("User has used this tool (tu_1)"))).toBe(true);
-    expect(normalized.messages.some((m) => m.content?.includes("Available tools"))).toBe(true);
     expect(normalized.messages.some((m) => m.content?.includes("Summarize."))).toBe(true);
+    // Tool catalogue is sent as RunRequest.mcp_tools, not as prompt text.
+    expect(normalized.messages.some((m) => m.content?.includes("Available tools"))).toBe(false);
   });
 
   it("accepts Claude thinking blocks for AgentService routing", () => {

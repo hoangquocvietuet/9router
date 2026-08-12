@@ -4,13 +4,28 @@ import { HTTP_STATUS, CURSOR_AGENT_IDLE_TIMEOUT_MS, CURSOR_AGENT_MAX_TURN_MS } f
 import {
   generateCursorBody,
   encodeField,
+  encodeMcpTools,
   wrapConnectRPCFrame,
   decodeMessage,
   parseConnectRPCFrame,
   extractTextFromResponse,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
-import { handleAgentExecRequest } from "../utils/cursorAgentExec.js";
+import {
+  handleAgentExecRequest,
+  replyAgentExecWithClientResult,
+  translateAgentExecRequestToClientTool,
+} from "../utils/cursorAgentExec.js";
+import {
+  claudeToolsToCursorToolMetadata,
+  extractClientToolResults,
+  flattenHistoryIntoCurrentUserText,
+  maybeCaptureToolRequest,
+} from "../utils/cursorToolBridge.js";
+import {
+  DEFAULT_PENDING_AGENT_TTL_MS,
+  getPendingAgentSessionRegistry,
+} from "../utils/cursorPendingAgentSessions.js";
 import { estimateUsage } from "../utils/usageTracking.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { chatChunkSse, sseChunk } from "../utils/sse.js";
@@ -143,7 +158,12 @@ function formatAvailableToolsText(tools) {
     const desc = tool?.function?.description || tool?.description;
     return desc ? `${name} — ${desc}` : name;
   });
-  return `Available tools:\n${parts.join("\n")}`;
+  return [
+    "Available tools:",
+    ...parts,
+    "",
+    "Execution policy: Treat the user's request as an actionable coding task. Use the available workspace tools to inspect the referenced repositories before answering. The multi-repository workspace is /root/projects; repository references such as @user and @inventory resolve under /root/projects/initxio unless the user supplies another path. Do not run repository checks from /root/projects itself. Do not replace an explicit task with workspace onboarding, setup narration, a generic repository map, or a request for the user to restate it. Do not claim an operation was performed unless its tool result was received.",
+  ].join("\n");
 }
 
 function appendTextToLastUserMessage(messages, extraText) {
@@ -285,10 +305,15 @@ function normalizeAgentMessages(messages, tools) {
   return declaration ? appendTextToLastUserMessage(normalized, declaration) : normalized;
 }
 
-export function normalizeAgentServiceRequest(body) {
+export function normalizeAgentServiceRequest(body, { includeToolCatalogueText = false } = {}) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const tools = body?.tools || body?.functions || [];
-  const messagesWithTools = normalizeAgentMessages(messages, tools);
+  // Real Cursor tool metadata goes on RunRequest.mcp_tools. Only keep the legacy
+  // "Available tools:" text dump when an explicit caller still wants it.
+  const messagesWithTools = normalizeAgentMessages(
+    messages,
+    includeToolCatalogueText ? tools : [],
+  );
 
   const {
     tools: _tools,
@@ -327,13 +352,22 @@ export function bodyHasToolSignals(body) {
 }
 
 /**
- * Cursor-only gateway shim: Claude Code / OpenAI clients keep their native tool
- * shapes on the wire to 9router; this converts tool/MCP history and declarations
- * to plain text before the Cursor upstream call and never emits mcp_tools on AgentService.
+ * Cursor-only gateway shim: flatten tool history to text for AgentService chat
+ * turns, and keep the original Claude/OpenAI tool catalogue for mcp_tools encoding
+ * plus client-side tool_use mapping.
  */
 export function prepareCursorGatewayRequest(body) {
   if (!bodyHasToolSignals(body)) return body;
-  return normalizeAgentServiceRequest(body);
+  maybeCaptureToolRequest(body);
+  return normalizeAgentServiceRequest(body, { includeToolCatalogueText: false });
+}
+
+/**
+ * Convert Claude or OpenAI tool declarations into the OpenAI-shaped catalogue
+ * encodeMcpTools / translateAgentExecRequestToClientTool expect.
+ */
+export function toCursorClientTools(tools = []) {
+  return claudeToolsToCursorToolMetadata(tools).map((meta) => meta.source);
 }
 
 export function shouldUseCursorAgentService(body) {
@@ -403,6 +437,251 @@ async function readAgentSessionChunk(session, idleMs, deadlineMs) {
   ]);
 }
 
+/**
+ * Consume AgentService stream frames until done, tool park, or error.
+ * @returns {Promise<{ parked: boolean }>}
+ */
+async function runAgentConsumeLoop({
+  session,
+  initialPending = Buffer.alloc(0),
+  declaredClientTools,
+  model,
+  credentials,
+  requestController,
+  onEvent,
+}) {
+  let pending = initialPending;
+  let finished = false;
+  let parked = false;
+
+  const turnStartedAt = Date.now();
+  const turnDeadline = turnStartedAt + CURSOR_AGENT_MAX_TURN_MS;
+  let hadText = false;
+  let execStubs = 0;
+  let lastFrameAt = turnStartedAt;
+
+  const finishTurn = (reason) => {
+    if (finished) return;
+    debugLog(`[CURSOR AGENT] Ending turn (${reason}) text=${hadText} stubs=${execStubs}`);
+    finished = true;
+    onEvent({ type: "done" });
+  };
+
+  try {
+    while (!finished) {
+      const readResult = await readAgentSessionChunk(
+        session,
+        CURSOR_AGENT_IDLE_TIMEOUT_MS,
+        turnDeadline,
+      );
+
+      if (readResult.idle) {
+        const sinceFrameMs = Date.now() - lastFrameAt;
+        if ((hadText || execStubs > 0) && sinceFrameMs >= CURSOR_AGENT_IDLE_TIMEOUT_MS) {
+          finishTurn(`idle ${sinceFrameMs}ms since last frame`);
+          break;
+        }
+        if (Date.now() >= turnDeadline) {
+          finishTurn("max turn time");
+          break;
+        }
+        continue;
+      }
+
+      const { done, value } = readResult;
+      if (done) break;
+      lastFrameAt = Date.now();
+      pending = Buffer.concat([pending, Buffer.from(value)]);
+      let toPark = null;
+      pending = decodeAgentFrames(pending, (payload) => {
+        if (finished) return;
+        const serverMessage = decodeMessage(payload);
+
+        if (serverMessage.has(1)) {
+          const update = decodeMessage(serverMessage.get(1)[0].value);
+          if (update.has(1)) {
+            const textDelta = extractAgentString(decodeMessage(update.get(1)[0].value), 1);
+            if (textDelta) {
+              hadText = true;
+              onEvent({ type: "text", value: textDelta });
+            }
+          }
+          if (update.has(14)) {
+            finished = true;
+            onEvent({ type: "done" });
+          }
+        }
+
+        if (serverMessage.has(2)) {
+          const execRequest = decodeMessage(serverMessage.get(2)[0].value);
+          execStubs++;
+          const clientToolCall = translateAgentExecRequestToClientTool(execRequest, declaredClientTools);
+          if (clientToolCall) {
+            toPark = { clientToolCall, execRequest };
+            finished = true;
+            onEvent({ type: "tool_call", value: clientToolCall });
+            onEvent({ type: "done" });
+            return;
+          }
+
+          if (execRequest.has(10) || execRequest.has(9)) {
+            const execKind = handleAgentExecRequest(execRequest, session, {
+              buildSimulatedToolResult: () => "",
+            });
+            debugLog(`[CURSOR AGENT] Control reply: ${execKind}`);
+            return;
+          }
+
+          finished = true;
+          onEvent({
+            type: "error",
+            value: "Cursor requested an IDE operation without a matching client-declared tool.",
+          });
+        }
+      });
+      if (toPark) {
+        parked = true;
+        getPendingAgentSessionRegistry().set(toPark.clientToolCall.id, {
+          toolCallId: toPark.clientToolCall.id,
+          execRequest: toPark.execRequest,
+          session,
+          pendingBytes: pending,
+          clientTools: declaredClientTools,
+          model,
+          credentials,
+          createdAt: Date.now(),
+          expiresAt: Date.now() + DEFAULT_PENDING_AGENT_TTL_MS,
+          requestController,
+        });
+      }
+    }
+  } finally {
+    if (!parked) {
+      try { session.end(); } catch {}
+      try { session.close(); } catch {}
+    }
+    if (!finished) onEvent({ type: "done" });
+  }
+
+  return { parked };
+}
+
+function buildAgentServiceExecutorResult({
+  stream,
+  body,
+  model,
+  url,
+  headers,
+  responseId,
+  created,
+  consume,
+  requestController,
+  getParked,
+}) {
+  if (stream === false) {
+    let content = "";
+    let reasoning = "";
+    let agentError = null;
+    let toolCalls = [];
+    const consumePromise = consume((event) => {
+      if (event.type === "text") content += event.value;
+      else if (event.type === "thinking") reasoning += event.value;
+      else if (event.type === "error") agentError = event.value;
+      else if (event.type === "tool_call") toolCalls = [event.value];
+    });
+    return {
+      consumePromise,
+      buildResult: () => {
+        if (agentError) {
+          return {
+            response: new Response(JSON.stringify({ error: { message: agentError, type: "api_error" } }), {
+              status: HTTP_STATUS.BAD_REQUEST,
+              headers: { "Content-Type": "application/json" },
+            }),
+            url,
+            headers,
+            transformedBody: body,
+            responseFormat: FORMATS.OPENAI,
+          };
+        }
+        return {
+          response: new Response(JSON.stringify({
+            id: responseId,
+            object: "chat.completion",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              message: {
+                role: "assistant",
+                content: content || null,
+                ...(reasoning ? { reasoning_content: reasoning } : {}),
+                ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+              },
+              finish_reason: toolCalls.length ? "tool_calls" : "stop",
+            }],
+            usage: estimateUsage(body, content.length, FORMATS.OPENAI),
+          }), { headers: { "Content-Type": "application/json" } }),
+          url,
+          headers,
+          transformedBody: body,
+          responseFormat: FORMATS.OPENAI,
+        };
+      },
+    };
+  }
+
+  const encoder = new TextEncoder();
+  const responseStream = new ReadableStream({
+    start(controller) {
+      let clientToolCall = null;
+      consume((event) => {
+        if (event.type === "text") {
+          controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { content: event.value } })));
+        } else if (event.type === "thinking") {
+          controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { reasoning_content: event.value } })));
+        } else if (event.type === "error") {
+          controller.enqueue(encoder.encode(sseChunk({ error: { message: event.value, type: "api_error" } })));
+          controller.enqueue(encoder.encode(SSE_DONE));
+          controller.close();
+        } else if (event.type === "tool_call") {
+          clientToolCall = event.value;
+          controller.enqueue(encoder.encode(chatChunkSse({
+            id: responseId,
+            created,
+            model,
+            delta: { role: "assistant", tool_calls: [{ index: 0, ...event.value }] },
+          })));
+        } else if (event.type === "done") {
+          controller.enqueue(encoder.encode(chatChunkSse({
+            id: responseId,
+            created,
+            model,
+            delta: {},
+            finishReason: clientToolCall ? "tool_calls" : "stop",
+          })));
+          controller.enqueue(encoder.encode(SSE_DONE));
+          controller.close();
+        }
+      }).catch((error) => controller.error(error));
+    },
+    cancel() {
+      if (!getParked()) requestController.abort();
+    },
+  });
+
+  return {
+    consumePromise: Promise.resolve(),
+    buildResult: () => ({
+      response: new Response(responseStream, { headers: SSE_HEADERS }),
+      url,
+      headers,
+      transformedBody: body,
+      responseFormat: FORMATS.OPENAI,
+    }),
+  };
+}
+
 function encodeHistoryMessage(message) {
   const content = textFromContent(message?.content);
   if (!content) return null;
@@ -415,7 +694,7 @@ function encodeHistoryMessage(message) {
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
 }
 
-export function buildAgentRunFrame(messages, model) {
+export function buildAgentRunFrame(messages, model, tools = []) {
   const system = messages
     .filter((message) => message?.role === "system")
     .map((message) => textFromContent(message.content))
@@ -424,30 +703,33 @@ export function buildAgentRunFrame(messages, model) {
   const chatMessages = messages.filter((message) => message?.role !== "system");
   const currentIndex = [...chatMessages].map((message) => message?.role).lastIndexOf("user");
   const current = currentIndex >= 0 ? chatMessages[currentIndex] : chatMessages.at(-1);
-  const history = chatMessages
-    .slice(0, currentIndex >= 0 ? currentIndex : -1)
-    .map(encodeHistoryMessage)
-    .filter(Boolean);
-  const userText = textFromContent(current?.content) || "Continue.";
+  const prior = chatMessages.slice(0, currentIndex >= 0 ? currentIndex : Math.max(chatMessages.length - 1, 0));
+  // AgentService frequently ignores conversation-history protobuf. Always fold
+  // the full converted Claude history into the current user text so the original
+  // task survives tool-result turns.
+  const flattenedPrior = flattenHistoryIntoCurrentUserText(prior);
+  const currentText = textFromContent(current?.content) || "";
+  const userText = [flattenedPrior, currentText].filter(Boolean).join("\n\n") || "Continue.";
 
-  // agent.v1.UserMessageAction.user_message and its optional history.
+  // agent.v1.UserMessageAction.user_message — history field intentionally empty;
+  // content is carried entirely in the current user text above.
   const userMessage = concatBuffers(
     agentString(1, userText),
     agentString(2, crypto.randomUUID()),
   );
-  const conversationHistory = history.length
-    ? concatBuffers(...history.map((entry) => agentMessage(1, entry)))
-    : null;
   const userAction = concatBuffers(
     agentMessage(1, userMessage),
-    ...(conversationHistory ? [agentMessage(7, conversationHistory)] : []),
   );
   const conversationAction = agentMessage(1, userAction);
   const requestedModel = concatBuffers(agentString(1, model), agentBool(7, true));
+  const cursorTools = toCursorClientTools(tools);
+  const mcpTools = cursorTools.length ? encodeMcpTools(cursorTools) : null;
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
     agentMessage(1, new Uint8Array()),
     agentMessage(2, conversationAction),
+    // agent.v1.RunRequest.mcp_tools = 4
+    ...(mcpTools ? [agentMessage(4, mcpTools)] : []),
     ...(system ? [agentString(8, system)] : []),
     agentMessage(9, requestedModel),
   );
@@ -790,7 +1072,7 @@ export class CursorExecutor extends BaseExecutor {
     };
   }
 
-  async executeAgent({ model, body, stream, credentials, signal }) {
+  async executeAgent({ model, body, stream, credentials, signal, clientTools = null }) {
     const agentEndpoint = PROVIDER_OAUTH.cursor?.agentEndpoint;
     if (!agentEndpoint) throw new Error("Cursor AgentService endpoint is not configured");
 
@@ -801,12 +1083,17 @@ export class CursorExecutor extends BaseExecutor {
       signal.addEventListener("abort", () => requestController.abort(signal.reason), { once: true });
     }
 
-    const agentBody = normalizeAgentServiceRequest(body);
+    const agentBody = normalizeAgentServiceRequest(body, { includeToolCatalogueText: false });
+    // Keep the original Claude/OpenAI catalogue for mcp_tools encoding and for
+    // mapping Cursor exec_request frames back to client tool_use blocks.
+    const declaredClientTools = toCursorClientTools(
+      clientTools || body?.tools || body?.functions || [],
+    );
 
     let session;
     try {
       session = this.openAgentHttp2Stream(url, headers, requestController.signal);
-      session.write(buildAgentRunFrame(agentBody.messages || [], model));
+      session.write(buildAgentRunFrame(agentBody.messages || [], model, declaredClientTools));
     } catch (error) {
       throw new Error(`Cursor AgentService request failed: ${error.message}`);
     }
@@ -846,169 +1133,129 @@ export class CursorExecutor extends BaseExecutor {
     // so strict clients such as Claude Code accept the completed stream.
     const responseId = `chatcmpl-msg_${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
-    let pending = Buffer.alloc(0);
-    let finished = false;
+    let parked = false;
 
     const consume = async (onEvent) => {
-      const turnStartedAt = Date.now();
-      const turnDeadline = turnStartedAt + CURSOR_AGENT_MAX_TURN_MS;
-      let hadText = false;
-      let execStubs = 0;
-      let lastFrameAt = turnStartedAt;
-
-      const finishTurn = (reason) => {
-        if (finished) return;
-        debugLog(`[CURSOR AGENT] Ending turn (${reason}) text=${hadText} stubs=${execStubs}`);
-        finished = true;
-        onEvent({ type: "done" });
-      };
-
-      try {
-        while (!finished) {
-          const readResult = await readAgentSessionChunk(
-            session,
-            CURSOR_AGENT_IDLE_TIMEOUT_MS,
-            turnDeadline,
-          );
-
-          if (readResult.idle) {
-            const sinceFrameMs = Date.now() - lastFrameAt;
-            if ((hadText || execStubs > 0) && sinceFrameMs >= CURSOR_AGENT_IDLE_TIMEOUT_MS) {
-              finishTurn(`idle ${sinceFrameMs}ms since last frame`);
-              break;
-            }
-            if (Date.now() >= turnDeadline) {
-              finishTurn("max turn time");
-              break;
-            }
-            continue;
-          }
-
-          const { done, value } = readResult;
-          if (done) break;
-          lastFrameAt = Date.now();
-          pending = Buffer.concat([pending, Buffer.from(value)]);
-          pending = decodeAgentFrames(pending, (payload) => {
-            // A single read can carry several frames; once the turn is over the
-            // rest of the batch must not reach the already-closed controller.
-            if (finished) return;
-            const serverMessage = decodeMessage(payload);
-
-            // agent.v1.AgentServerMessage.interaction_update
-            if (serverMessage.has(1)) {
-              const update = decodeMessage(serverMessage.get(1)[0].value);
-              if (update.has(1)) {
-                const textDelta = extractAgentString(decodeMessage(update.get(1)[0].value), 1);
-                if (textDelta) {
-                  hadText = true;
-                  onEvent({ type: "text", value: textDelta });
-                }
-              }
-              // Cursor's AgentService emits internal reasoning without the
-              // cryptographic signature required by Anthropic thinking blocks.
-              // Forwarding it makes strict Anthropic clients (Claude Code)
-              // discard or wait on an otherwise complete response. Keep the
-              // reasoning upstream-only and emit the normal answer text.
-              if (update.has(14)) {
-                finished = true;
-                onEvent({ type: "done" });
-              }
-            }
-
-            if (serverMessage.has(2)) {
-              const execRequest = decodeMessage(serverMessage.get(2)[0].value);
-              execStubs++;
-              const execKind = handleAgentExecRequest(execRequest, session, { buildSimulatedToolResult });
-              debugLog(`[CURSOR AGENT] Exec reply: ${execKind}`);
-            }
-          });
-        }
-      } finally {
-        try { session.end(); } catch {}
-        try { session.close(); } catch {}
-        if (!finished) onEvent({ type: "done" });
-      }
+      const result = await runAgentConsumeLoop({
+        session,
+        initialPending: Buffer.alloc(0),
+        declaredClientTools,
+        model,
+        credentials,
+        requestController,
+        onEvent,
+      });
+      parked = result.parked;
     };
 
-    if (stream === false) {
-      let content = "";
-      let reasoning = "";
-      let agentError = null;
-      await consume((event) => {
-        if (event.type === "text") content += event.value;
-        else if (event.type === "thinking") reasoning += event.value;
-        else if (event.type === "error") agentError = event.value;
-      });
-      if (agentError) {
-        return {
-          response: new Response(JSON.stringify({ error: { message: agentError, type: "api_error" } }), {
-            status: HTTP_STATUS.BAD_REQUEST,
-            headers: { "Content-Type": "application/json" },
-          }),
-          url,
-          headers,
-          transformedBody: body,
-          responseFormat: FORMATS.OPENAI,
-        };
-      }
-      return {
-        response: new Response(JSON.stringify({
-          id: responseId,
-          object: "chat.completion",
-          created,
-          model,
-          choices: [{ index: 0, message: { role: "assistant", content: content || null, ...(reasoning ? { reasoning_content: reasoning } : {}) }, finish_reason: "stop" }],
-          usage: estimateUsage(body, content.length, FORMATS.OPENAI),
-        }), { headers: { "Content-Type": "application/json" } }),
-        url,
-        headers,
-        transformedBody: body,
-        responseFormat: FORMATS.OPENAI,
-      };
-    }
-
-    const encoder = new TextEncoder();
-    const responseStream = new ReadableStream({
-      start(controller) {
-        consume((event) => {
-          if (event.type === "text") {
-            controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { content: event.value } })));
-          } else if (event.type === "thinking") {
-            controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { reasoning_content: event.value } })));
-          } else if (event.type === "error") {
-            // An SSE error frame, not a content delta: a protocol failure must not
-            // be rendered to the user as the assistant's reply, and downstream
-            // usage tracking must not record the turn as a success.
-            controller.enqueue(encoder.encode(sseChunk({ error: { message: event.value, type: "api_error" } })));
-            controller.enqueue(encoder.encode(SSE_DONE));
-            controller.close();
-          } else if (event.type === "done") {
-            controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: {}, finishReason: "stop" })));
-            controller.enqueue(encoder.encode(SSE_DONE));
-            controller.close();
-          }
-        }).catch((error) => controller.error(error));
-      },
-      cancel() {
-        requestController.abort();
-      },
-    });
-
-    return {
-      response: new Response(responseStream, { headers: SSE_HEADERS }),
+    const { consumePromise, buildResult } = buildAgentServiceExecutorResult({
+      stream,
+      body,
+      model,
       url,
       headers,
-      transformedBody: body,
-      responseFormat: FORMATS.OPENAI,
+      responseId,
+      created,
+      consume,
+      requestController,
+      getParked: () => parked,
+    });
+
+    if (stream === false) {
+      await consumePromise;
+      return buildResult();
+    }
+    return buildResult();
+  }
+
+  async resumeAgentSession({ pending, toolResult, stream, signal, body }) {
+    const agentEndpoint = PROVIDER_OAUTH.cursor?.agentEndpoint;
+    const url = `${agentEndpoint || ""}${AGENT_RUN_PATH}`;
+    const { session, pendingBytes, clientTools, model, credentials, requestController } = pending;
+    const headers = this.buildHeaders(credentials);
+
+    try {
+      replyAgentExecWithClientResult(
+        pending.execRequest,
+        session,
+        toolResult.content,
+        { isError: !!toolResult.isError },
+      );
+    } catch (error) {
+      try { session.end?.(); } catch {}
+      try { session.close?.(); } catch {}
+      throw error;
+    }
+
+    const responseId = `chatcmpl-msg_${Date.now()}`;
+    const created = Math.floor(Date.now() / 1000);
+    let parked = false;
+
+    const consume = async (onEvent) => {
+      const result = await runAgentConsumeLoop({
+        session,
+        initialPending: pendingBytes || Buffer.alloc(0),
+        declaredClientTools: clientTools,
+        model,
+        credentials,
+        requestController,
+        onEvent,
+      });
+      parked = result.parked;
     };
+
+    const { consumePromise, buildResult } = buildAgentServiceExecutorResult({
+      stream,
+      body,
+      model,
+      url,
+      headers,
+      responseId,
+      created,
+      consume,
+      requestController,
+      getParked: () => parked,
+    });
+
+    if (stream === false) {
+      await consumePromise;
+      return buildResult();
+    }
+    return buildResult();
   }
 
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    const gatewayBody = prepareCursorGatewayRequest(body);
-
     if (shouldUseCursorAgentService(body)) {
+      const pendingRegistry = getPendingAgentSessionRegistry();
+      const results = extractClientToolResults(body);
+      const matchId = results.map((r) => r.toolCallId).find((id) => pendingRegistry.get(id));
+      if (matchId) {
+        const pending = pendingRegistry.take(matchId);
+        const toolResult = results.find((r) => r.toolCallId === matchId);
+        try {
+          return await this.resumeAgentSession({ pending, toolResult, stream, signal, body });
+        } catch (error) {
+          return {
+            response: new Response(JSON.stringify({
+              error: { message: error.message, type: "connection_error", code: "" },
+            }), { status: HTTP_STATUS.SERVER_ERROR, headers: { "Content-Type": "application/json" } }),
+            url: `${PROVIDER_OAUTH.cursor?.agentEndpoint || ""}${AGENT_RUN_PATH}`,
+            headers: {},
+            transformedBody: body,
+          };
+        }
+      }
+
+      const gatewayBody = prepareCursorGatewayRequest(body);
       try {
-        return await this.executeAgent({ model, body: gatewayBody, stream, credentials, signal });
+        return await this.executeAgent({
+          model,
+          body: gatewayBody,
+          stream,
+          credentials,
+          signal,
+          clientTools: body?.tools || body?.functions || [],
+        });
       } catch (error) {
         return {
           response: new Response(JSON.stringify({
@@ -1020,6 +1267,8 @@ export class CursorExecutor extends BaseExecutor {
         };
       }
     }
+
+    const gatewayBody = prepareCursorGatewayRequest(body);
 
     const url = this.buildUrl();
     const headers = this.buildHeaders(credentials);

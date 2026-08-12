@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { formatDisplayValue, hasDisplayValue } from "@/app/(dashboard)/dashboard/usage/components/requestDetailDisplay.js";
 
 const originalDataDir = process.env.DATA_DIR;
 let tempDir;
@@ -22,7 +23,7 @@ beforeAll(async () => {
   vi.resetModules();
   db = await import("@/lib/db/index.js");
   await db.initDb();
-  await db.updateSettings({ enableObservability2: true, observabilityBatchSize: 1 });
+  await db.updateSettings({ enableObservability: true, observabilityBatchSize: 1 });
 
   const { getAdapter } = await import("@/lib/db/driver.js");
   adapter = await getAdapter();
@@ -106,6 +107,71 @@ describe("request details — tab crash-risk cases", () => {
     expect(got.tokens).toBeUndefined();
     // Drawer reads tokens?.prompt_tokens — optional chaining tolerates undefined
     expect(got.tokens?.prompt_tokens || 0).toBe(0);
+  });
+
+  it("null top-level fields stay null through save/read (not coerced to {})", async () => {
+    await saveDetail({
+      id: "null-fields-1",
+      provider: "cursor",
+      model: "composer-2.5",
+      status: "success",
+      tokens: { prompt_tokens: 2031, completion_tokens: 1 },
+      request: null,
+      providerRequest: null,
+      providerResponse: null,
+      response: { content: [{ type: "text", text: "Hello." }], thinking: null },
+    });
+
+    const got = await db.getRequestDetailById("null-fields-1");
+    expect(got.request).toBeNull();
+    expect(got.providerRequest).toBeNull();
+    expect(got.providerResponse).toBeNull();
+    expect(got.response.thinking).toBeNull();
+    expect(got.response.content).toEqual([{ type: "text", text: "Hello." }]);
+  });
+});
+
+describe("requestDetailDisplay — drawer-safe formatting", () => {
+  const structuredContent = [{ type: "text", text: "Hello." }];
+
+  it("production cursor row: structured content + empty thinking shape", () => {
+    const response = { content: structuredContent, thinking: {} };
+
+    expect(hasDisplayValue(response.thinking)).toBe(false);
+    expect(hasDisplayValue(response.content)).toBe(true);
+    expect(formatDisplayValue(response.content)).toBe(
+      JSON.stringify(structuredContent, null, 2)
+    );
+    expect(formatDisplayValue(response.thinking)).toBe("[No content]");
+  });
+
+  it("hasDisplayValue covers null, undefined, empty, and populated values", () => {
+    expect(hasDisplayValue(null)).toBe(false);
+    expect(hasDisplayValue(undefined)).toBe(false);
+    expect(hasDisplayValue("")).toBe(false);
+    expect(hasDisplayValue("   ")).toBe(false);
+    expect(hasDisplayValue([])).toBe(false);
+    expect(hasDisplayValue({})).toBe(false);
+    expect(hasDisplayValue("Hello.")).toBe(true);
+    expect(hasDisplayValue(structuredContent)).toBe(true);
+    expect(hasDisplayValue({ a: 1 })).toBe(true);
+    expect(hasDisplayValue(0)).toBe(true);
+    expect(hasDisplayValue(false)).toBe(true);
+  });
+
+  it("formatDisplayValue stringifies structured values and never returns raw objects", () => {
+    expect(formatDisplayValue("Hello.")).toBe("Hello.");
+    expect(formatDisplayValue(42)).toBe("42");
+    expect(formatDisplayValue(false)).toBe("false");
+    expect(formatDisplayValue(null)).toBe("[No content]");
+    expect(formatDisplayValue(undefined, "missing")).toBe("missing");
+    expect(formatDisplayValue(structuredContent)).toBe(
+      JSON.stringify(structuredContent, null, 2)
+    );
+    expect(formatDisplayValue({ nested: { ok: true } })).toBe(
+      JSON.stringify({ nested: { ok: true } }, null, 2)
+    );
+    expect(typeof formatDisplayValue(structuredContent)).toBe("string");
   });
 });
 

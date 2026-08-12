@@ -1,6 +1,6 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
-import { HTTP_STATUS } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, CURSOR_AGENT_IDLE_TIMEOUT_MS, CURSOR_AGENT_MAX_TURN_MS } from "../config/runtimeConfig.js";
 import {
   generateCursorBody,
   encodeField,
@@ -8,7 +8,7 @@ import {
   decodeMessage,
   parseConnectRPCFrame,
   extractTextFromResponse,
-  encodeMcpResultError,
+  encodeMcpResultSuccess,
   decodeMcpArgs,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
@@ -313,13 +313,26 @@ export function normalizeAgentServiceRequest(body) {
 }
 
 function writeGatewayMcpToolReply(session, mcpArgs, toolName) {
-  const reply = encodeMcpResultError(GATEWAY_TOOL_ERROR);
+  const reply = encodeMcpResultSuccess({
+    textItems: [GATEWAY_TOOL_ERROR],
+    isError: true,
+  });
   const execClientMessage = concatBuffers(
     agentMessage(2, reply),
     mcpArgs?.toolCallId ? agentString(3, mcpArgs.toolCallId) : new Uint8Array(),
   );
   session.write(wrapConnectRPCFrame(agentMessage(2, execClientMessage)));
   debugLog(`[CURSOR AGENT] Stubbed MCP/IDE tool ${toolName || mcpArgs?.toolName || mcpArgs?.name || "unknown"}`);
+}
+
+async function readAgentSessionChunk(session, idleMs, deadlineMs) {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) return { idle: true };
+  const waitMs = Math.min(idleMs, remaining);
+  return await Promise.race([
+    session.read(),
+    new Promise((resolve) => setTimeout(() => resolve({ idle: true }), waitMs)),
+  ]);
 }
 
 function writeGatewayExecStubReply(session, execRequest) {
@@ -794,9 +807,39 @@ export class CursorExecutor extends BaseExecutor {
     let finished = false;
 
     const consume = async (onEvent) => {
+      const turnStartedAt = Date.now();
+      const turnDeadline = turnStartedAt + CURSOR_AGENT_MAX_TURN_MS;
+      let hadText = false;
+      let execStubs = 0;
+
+      const finishTurn = (reason) => {
+        if (finished) return;
+        debugLog(`[CURSOR AGENT] Ending turn (${reason}) text=${hadText} stubs=${execStubs}`);
+        finished = true;
+        onEvent({ type: "done" });
+      };
+
       try {
         while (!finished) {
-          const { done, value } = await session.read();
+          const readResult = await readAgentSessionChunk(
+            session,
+            CURSOR_AGENT_IDLE_TIMEOUT_MS,
+            turnDeadline,
+          );
+
+          if (readResult.idle) {
+            if (hadText || execStubs > 0) {
+              finishTurn(`idle ${CURSOR_AGENT_IDLE_TIMEOUT_MS}ms`);
+              break;
+            }
+            if (Date.now() >= turnDeadline) {
+              finishTurn("max turn time");
+              break;
+            }
+            continue;
+          }
+
+          const { done, value } = readResult;
           if (done) break;
           pending = Buffer.concat([pending, Buffer.from(value)]);
           pending = decodeAgentFrames(pending, (payload) => {
@@ -810,7 +853,10 @@ export class CursorExecutor extends BaseExecutor {
               const update = decodeMessage(serverMessage.get(1)[0].value);
               if (update.has(1)) {
                 const textDelta = extractAgentString(decodeMessage(update.get(1)[0].value), 1);
-                if (textDelta) onEvent({ type: "text", value: textDelta });
+                if (textDelta) {
+                  hadText = true;
+                  onEvent({ type: "text", value: textDelta });
+                }
               }
               // Cursor's AgentService emits internal reasoning without the
               // cryptographic signature required by Anthropic thinking blocks.
@@ -830,12 +876,14 @@ export class CursorExecutor extends BaseExecutor {
               if (execRequest.has(10)) {
                 session.write(createRequestContextResponse());
               } else if (execRequest.has(2)) {
+                execStubs++;
                 const argsBuffer = execRequest.get(2)[0]?.value || new Uint8Array();
                 let mcpArgs;
                 try { mcpArgs = decodeMcpArgs(argsBuffer); } catch { mcpArgs = null; }
                 const toolName = mcpArgs?.toolName || mcpArgs?.name;
                 writeGatewayMcpToolReply(session, mcpArgs, toolName);
               } else {
+                execStubs++;
                 debugLog(`[CURSOR AGENT] Stubbing unsupported exec request fields: ${[...execRequest.keys()].join(",")}`);
                 writeGatewayExecStubReply(session, execRequest);
               }

@@ -42,8 +42,10 @@ function stubAgentSession(executor, frames) {
     end() {},
     close() {},
     async read() {
-      if (!queue.length) return { value: undefined, done: true };
-      return { value: queue.shift(), done: false };
+      if (queue.length) return { value: queue.shift(), done: false };
+      return new Promise((resolve) => {
+        setTimeout(() => resolve({ value: undefined, done: true }), 50);
+      });
     },
   });
   return written;
@@ -82,8 +84,8 @@ describe("CursorExecutor AgentService exec_request handling", () => {
       stream: true,
     });
 
-    expect(written.length).toBe(2); // run frame + request-context reply
     const events = parseSSE(await result.response.text());
+    expect(written.length).toBe(2); // run frame + request-context reply
     const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
     expect(content).toBe("hello");
   });
@@ -94,13 +96,14 @@ describe("CursorExecutor AgentService exec_request handling", () => {
       stream: true,
     });
 
+    const body = await result.response.text();
     expect(written.length).toBe(2); // run frame + MCP tool result
     const responseFrame = parseConnectRPCFrame(written[1]);
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
     const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
-    expect(resultMessage.has(2)).toBe(true); // McpResult.error
-    expect(await result.response.text()).toContain("hello");
+    expect(resultMessage.has(1)).toBe(true); // McpResult payload (is_error)
+    expect(body).toContain("hello");
   });
 
   it("replies with a gateway MCP error for a declared tool", async () => {
@@ -110,12 +113,13 @@ describe("CursorExecutor AgentService exec_request handling", () => {
       tools: [{ type: "function", function: { name: "declared_tool" } }],
     });
 
+    const body = await result.response.text();
     const responseFrame = parseConnectRPCFrame(written[1]);
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
     const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
-    expect(resultMessage.has(2)).toBe(true); // McpResult.error
-    expect(await result.response.text()).toContain("hello");
+    expect(resultMessage.has(1)).toBe(true); // McpResult payload (is_error)
+    expect(body).toContain("hello");
   });
 
   it("stubs unsupported exec requests and keeps streaming assistant text", async () => {

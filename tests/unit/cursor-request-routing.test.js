@@ -68,16 +68,16 @@ describe("Cursor request routing", () => {
     expect(result.response.status).toBe(200);
   });
 
-  it("routes tool declarations without tool history to AgentService", async () => {
+  it("routes tool declarations to legacy ChatService (text-normalized)", async () => {
     const { executor, result } = await execute([
       { role: "user", content: "Reply OK without calling tools" },
     ], [weatherTool]);
 
-    expect(executor.route).toBe("agent-service");
-    expect(result.response.status).toBe(200);
+    expect(executor.route).toBe("legacy-chat-service");
+    expect(result.response.status).toBe(429);
   });
 
-  it("routes assistant tool-call history to AgentService", async () => {
+  it("routes assistant tool-call history to legacy ChatService", async () => {
     const { executor, result } = await execute([
       { role: "user", content: "Weather in Hanoi?" },
       {
@@ -93,18 +93,18 @@ describe("Cursor request routing", () => {
       { role: "user", content: "Summarize the result" },
     ], [weatherTool]);
 
-    expect(executor.route).toBe("agent-service");
-    expect(result.response.status).toBe(200);
+    expect(executor.route).toBe("legacy-chat-service");
+    expect(result.response.status).toBe(429);
   });
 
-  it("routes role:tool history to AgentService", async () => {
+  it("routes role:tool history to legacy ChatService", async () => {
     const { executor, result } = await execute([
       { role: "user", content: "Weather in Hanoi?" },
       { role: "tool", tool_call_id: "call_1", content: "Sunny" },
       { role: "user", content: "Summarize the result" },
     ], [weatherTool]);
 
-    expect(executor.route).toBe("agent-service");
-    expect(result.response.status).toBe(200);
+    expect(executor.route).toBe("legacy-chat-service");
+    expect(result.response.status).toBe(429);
   });
 });

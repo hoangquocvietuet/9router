@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   isAgentCapableRequest,
   normalizeAgentServiceRequest,
+  bodyHasToolSignals,
+  shouldUseCursorAgentService,
 } from "../../open-sse/executors/cursor.js";
 
 describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
@@ -58,5 +60,14 @@ describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
     expect(isAgentCapableRequest({
       messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://x.test/a.png" } }] }],
     })).toBe(false);
+  });
+
+  it("skips AgentService when tools are declared", () => {
+    const body = {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "read_file", input_schema: { type: "object" } }],
+    };
+    expect(bodyHasToolSignals(body)).toBe(true);
+    expect(shouldUseCursorAgentService(body)).toBe(false);
   });
 });

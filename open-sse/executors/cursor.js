@@ -287,11 +287,6 @@ function normalizeAgentMessages(messages, tools) {
   return declaration ? appendTextToLastUserMessage(normalized, declaration) : normalized;
 }
 
-/**
- * Cursor-only gateway shim: Claude Code / OpenAI clients keep their native tool
- * shapes on the wire to 9router; this converts tool/MCP history and declarations
- * to plain text before AgentService and never emits mcp_tools upstream.
- */
 export function normalizeAgentServiceRequest(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const tools = body?.tools || body?.functions || [];
@@ -310,6 +305,43 @@ export function normalizeAgentServiceRequest(body) {
     messages: messagesWithTools,
     tools: [],
   };
+}
+
+/** True when the client sent tool declarations or tool-turn history (Claude Code / paseo). */
+export function bodyHasToolSignals(body) {
+  if (!body || typeof body !== "object") return false;
+  if (Array.isArray(body.tools) && body.tools.length > 0) return true;
+  if (Array.isArray(body.functions) && body.functions.length > 0) return true;
+  if (!Array.isArray(body.messages)) return false;
+  return body.messages.some((message) => {
+    if (!message || typeof message !== "object") return false;
+    if (message.role === "tool" || message.role === "function") return true;
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return true;
+    if (Array.isArray(message.tool_results) && message.tool_results.length > 0) return true;
+    if (!Array.isArray(message.content)) return false;
+    return message.content.some((part) =>
+      part?.type === CLAUDE_BLOCK.TOOL_USE
+      || part?.type === CLAUDE_BLOCK.TOOL_RESULT
+      || part?.type === "tool_use"
+      || part?.type === "tool_result"
+    );
+  });
+}
+
+/**
+ * Cursor-only gateway shim: Claude Code / OpenAI clients keep their native tool
+ * shapes on the wire to 9router; this converts tool/MCP history and declarations
+ * to plain text before the Cursor upstream call and never emits mcp_tools on AgentService.
+ */
+export function prepareCursorGatewayRequest(body) {
+  if (!bodyHasToolSignals(body)) return body;
+  return normalizeAgentServiceRequest(body);
+}
+
+export function shouldUseCursorAgentService(body) {
+  // AgentService runs Cursor's IDE agent loop, which stalls on gateway tool stubs.
+  // Tool-bearing Claude Code / paseo sessions use legacy ChatService with text-only upstream.
+  return isAgentCapableRequest(body) && !bodyHasToolSignals(body);
 }
 
 function writeGatewayMcpToolReply(session, mcpArgs, toolName) {
@@ -811,6 +843,7 @@ export class CursorExecutor extends BaseExecutor {
       const turnDeadline = turnStartedAt + CURSOR_AGENT_MAX_TURN_MS;
       let hadText = false;
       let execStubs = 0;
+      let lastFrameAt = turnStartedAt;
 
       const finishTurn = (reason) => {
         if (finished) return;
@@ -828,8 +861,9 @@ export class CursorExecutor extends BaseExecutor {
           );
 
           if (readResult.idle) {
-            if (hadText || execStubs > 0) {
-              finishTurn(`idle ${CURSOR_AGENT_IDLE_TIMEOUT_MS}ms`);
+            const sinceFrameMs = Date.now() - lastFrameAt;
+            if ((hadText || execStubs > 0) && sinceFrameMs >= CURSOR_AGENT_IDLE_TIMEOUT_MS) {
+              finishTurn(`idle ${sinceFrameMs}ms since last frame`);
               break;
             }
             if (Date.now() >= turnDeadline) {
@@ -841,6 +875,7 @@ export class CursorExecutor extends BaseExecutor {
 
           const { done, value } = readResult;
           if (done) break;
+          lastFrameAt = Date.now();
           pending = Buffer.concat([pending, Buffer.from(value)]);
           pending = decodeAgentFrames(pending, (payload) => {
             // A single read can carry several frames; once the turn is over the
@@ -971,9 +1006,11 @@ export class CursorExecutor extends BaseExecutor {
   }
 
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
-    if (isAgentCapableRequest(body)) {
+    const gatewayBody = prepareCursorGatewayRequest(body);
+
+    if (shouldUseCursorAgentService(body)) {
       try {
-        return await this.executeAgent({ model, body, stream, credentials, signal });
+        return await this.executeAgent({ model, body: gatewayBody, stream, credentials, signal });
       } catch (error) {
         return {
           response: new Response(JSON.stringify({
@@ -986,9 +1023,13 @@ export class CursorExecutor extends BaseExecutor {
       }
     }
 
+    if (bodyHasToolSignals(body)) {
+      log?.info?.("CURSOR", `${model} | ChatService text-normalized | tools=${body?.tools?.length || 0} msgs=${body?.messages?.length || 0}`);
+    }
+
     const url = this.buildUrl();
     const headers = this.buildHeaders(credentials);
-    const transformedBody = this.transformRequest(model, body, stream, credentials);
+    const transformedBody = this.transformRequest(model, gatewayBody, stream, credentials);
 
     try {
       const shouldForceFetch = proxyOptions?.enabled === true || proxyOptions?.connectionProxyEnabled === true || !!proxyOptions?.vercelRelayUrl;

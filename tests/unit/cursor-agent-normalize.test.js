@@ -5,6 +5,7 @@ import {
   normalizeAgentServiceRequest,
   bodyHasToolSignals,
   shouldUseCursorAgentService,
+  agentTurnIdleThresholdMs,
 } from "../../open-sse/executors/cursor.js";
 
 describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
@@ -62,12 +63,18 @@ describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
     })).toBe(false);
   });
 
-  it("skips AgentService when tools are declared", () => {
+  it("keeps AgentService for tool declarations (ChatService returns Update Required)", () => {
     const body = {
       messages: [{ role: "user", content: "hi" }],
       tools: [{ name: "read_file", input_schema: { type: "object" } }],
     };
     expect(bodyHasToolSignals(body)).toBe(true);
-    expect(shouldUseCursorAgentService(body)).toBe(false);
+    expect(shouldUseCursorAgentService(body)).toBe(true);
+  });
+
+  it("uses a shorter idle window after text plus exec stubs", () => {
+    expect(agentTurnIdleThresholdMs({ hadText: true, execStubs: 2 })).toBe(8 * 1000);
+    expect(agentTurnIdleThresholdMs({ hadText: true, execStubs: 0 })).toBe(120 * 1000);
+    expect(agentTurnIdleThresholdMs({ hadText: false, execStubs: 1 })).toBe(120 * 1000);
   });
 });

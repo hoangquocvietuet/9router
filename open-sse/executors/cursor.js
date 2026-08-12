@@ -1,6 +1,6 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
-import { HTTP_STATUS, CURSOR_AGENT_IDLE_TIMEOUT_MS, CURSOR_AGENT_MAX_TURN_MS } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, CURSOR_AGENT_IDLE_TIMEOUT_MS, CURSOR_AGENT_EXEC_TAIL_IDLE_MS, CURSOR_AGENT_MAX_TURN_MS } from "../config/runtimeConfig.js";
 import {
   generateCursorBody,
   encodeField,
@@ -339,9 +339,13 @@ export function prepareCursorGatewayRequest(body) {
 }
 
 export function shouldUseCursorAgentService(body) {
-  // AgentService runs Cursor's IDE agent loop, which stalls on gateway tool stubs.
-  // Tool-bearing Claude Code / paseo sessions use legacy ChatService with text-only upstream.
-  return isAgentCapableRequest(body) && !bodyHasToolSignals(body);
+  return isAgentCapableRequest(body);
+}
+
+/** Idle window before ending an AgentService turn when upstream stops sending frames. */
+export function agentTurnIdleThresholdMs({ hadText, execStubs }) {
+  if (hadText && execStubs > 0) return CURSOR_AGENT_EXEC_TAIL_IDLE_MS;
+  return CURSOR_AGENT_IDLE_TIMEOUT_MS;
 }
 
 function writeGatewayMcpToolReply(session, mcpArgs, toolName) {
@@ -854,16 +858,17 @@ export class CursorExecutor extends BaseExecutor {
 
       try {
         while (!finished) {
+          const idleMs = agentTurnIdleThresholdMs({ hadText, execStubs });
           const readResult = await readAgentSessionChunk(
             session,
-            CURSOR_AGENT_IDLE_TIMEOUT_MS,
+            idleMs,
             turnDeadline,
           );
 
           if (readResult.idle) {
             const sinceFrameMs = Date.now() - lastFrameAt;
-            if ((hadText || execStubs > 0) && sinceFrameMs >= CURSOR_AGENT_IDLE_TIMEOUT_MS) {
-              finishTurn(`idle ${sinceFrameMs}ms since last frame`);
+            if ((hadText || execStubs > 0) && sinceFrameMs >= idleMs) {
+              finishTurn(`idle ${sinceFrameMs}ms since last frame (threshold ${idleMs}ms)`);
               break;
             }
             if (Date.now() >= turnDeadline) {
@@ -1021,10 +1026,6 @@ export class CursorExecutor extends BaseExecutor {
           transformedBody: body,
         };
       }
-    }
-
-    if (bodyHasToolSignals(body)) {
-      log?.info?.("CURSOR", `${model} | ChatService text-normalized | tools=${body?.tools?.length || 0} msgs=${body?.messages?.length || 0}`);
     }
 
     const url = this.buildUrl();

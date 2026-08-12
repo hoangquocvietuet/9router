@@ -8,9 +8,7 @@ import {
   decodeMessage,
   parseConnectRPCFrame,
   extractTextFromResponse,
-  encodeMcpTools,
   encodeMcpResultError,
-  encodeMcpResultToolNotFound,
   decodeMcpArgs,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
@@ -18,6 +16,8 @@ import { estimateUsage } from "../utils/usageTracking.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { chatChunkSse, sseChunk } from "../utils/sse.js";
 import { FORMATS } from "../translator/formats.js";
+import { extractTextContent } from "../translator/formats/gemini.js";
+import { CLAUDE_BLOCK } from "../translator/schema/blocks.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import zlib from "zlib";
 import crypto from "crypto";
@@ -49,6 +49,19 @@ const COMPRESS_FLAG = {
 const AGENT_RUN_PATH = "/agent.v1.AgentService/Run";
 const PROTOBUF_LEN = 2;
 const PROTOBUF_VARINT = 0;
+const GATEWAY_TOOL_ERROR = "Tool execution is not supported through the 9router gateway. Use the available-tools list and tool history text in the conversation.";
+const NORMALIZABLE_CONTENT_TYPES = new Set([
+  CLAUDE_BLOCK.TEXT,
+  CLAUDE_BLOCK.TOOL_USE,
+  CLAUDE_BLOCK.TOOL_RESULT,
+  CLAUDE_BLOCK.THINKING,
+  CLAUDE_BLOCK.REDACTED_THINKING,
+  "text",
+  "tool_use",
+  "tool_result",
+  "thinking",
+  "redacted_thinking",
+]);
 
 function concatBuffers(...parts) {
   const length = parts.reduce((total, part) => total + part.length, 0);
@@ -75,18 +88,16 @@ function textFromContent(content) {
 }
 
 export function isAgentCapableRequest(body) {
-  // The AgentService handler can service every request whose messages are
-  // text-only: plain strings or text-part arrays. Conversations that carry
-  // tool history are routed through AgentService as well — its exec_request
-  // protocol carries the tool declarations and tool results. Non-text
-  // content (image, audio, file parts) still falls back to legacy paths
-  // elsewhere.
+  // Cursor AgentService requests are normalized to plain text in-place (tools/MCP
+  // stripped). Non-text modalities still use legacy ChatService paths.
   return Array.isArray(body?.messages) && body.messages.length > 0 && body.messages.every((message) => {
     if (!message || typeof message !== "object") return false;
     const content = message.content;
     if (typeof content === "string") return true;
-    if (Array.isArray(content)) return content.every((part) => part?.type === "text" && typeof part.text === "string");
-    if (content === null || content === undefined) return true; // tool-call markers carry no content
+    if (Array.isArray(content)) {
+      return content.every((part) => part?.type && NORMALIZABLE_CONTENT_TYPES.has(part.type));
+    }
+    if (content === null || content === undefined) return true;
     return false;
   });
 }
@@ -94,25 +105,241 @@ export function isAgentCapableRequest(body) {
 // Back-compat alias kept for callers that still reference the old name.
 export const isAgentTextRequest = isAgentCapableRequest;
 
-function toolHistoryText(message) {
-  if (message?.role === "tool") {
-    const content = textFromContent(message.content);
-    return `Tool result${message.tool_call_id ? ` (${message.tool_call_id})` : ""}: ${content}`;
+function toolDisplayName(name) {
+  if (!name || typeof name !== "string") return "unknown";
+  if (name.startsWith("mcp__")) return name.split("__").filter(Boolean).join("/");
+  return name;
+}
+
+function formatToolArgs(args) {
+  if (typeof args === "string") return args;
+  if (args && typeof args === "object") return JSON.stringify(args);
+  return "{}";
+}
+
+function extractToolResultContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((part) => part?.type === CLAUDE_BLOCK.TEXT || part?.type === "text")
+      .map((part) => part.text || "")
+      .join("\n") || extractTextContent(content) || JSON.stringify(content);
+  }
+  if (content && typeof content === "object") return JSON.stringify(content);
+  return String(content ?? "");
+}
+
+function formatToolCallsUsed(toolCalls) {
+  return toolCalls.map((call) => {
+    const name = toolDisplayName(call?.function?.name || call?.name);
+    const args = formatToolArgs(call?.function?.arguments ?? call?.arguments ?? call?.input);
+    const id = call?.id || call?.tool_call_id;
+    return id ? `${name}(${args}) [${id}]` : `${name}(${args})`;
+  }).join(", ");
+}
+
+function formatAvailableToolsText(tools) {
+  if (!tools?.length) return "";
+  const parts = tools.map((tool) => {
+    const name = toolDisplayName(tool?.function?.name || tool?.name);
+    const desc = tool?.function?.description || tool?.description;
+    return desc ? `${name} — ${desc}` : name;
+  });
+  return `Available tools:\n${parts.join("\n")}`;
+}
+
+function appendTextToLastUserMessage(messages, extraText) {
+  if (!extraText) return messages;
+  const result = messages.map((message) => ({ ...message }));
+  for (let i = result.length - 1; i >= 0; i--) {
+    if (result[i].role === "user") {
+      const existing = textFromContent(result[i].content);
+      result[i] = {
+        role: "user",
+        content: existing ? `${existing}\n\n${extraText}` : extraText,
+      };
+      return result;
+    }
+  }
+  result.push({ role: "user", content: extraText });
+  return result;
+}
+
+function flattenContentBlocks(message) {
+  const out = [];
+  const role = message.role === "assistant" ? "assistant" : "user";
+  const textParts = [];
+  const toolUses = [];
+  const toolResults = [];
+
+  for (const block of message.content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === CLAUDE_BLOCK.TEXT || block.type === "text") {
+      if (block.text) textParts.push(block.text);
+      continue;
+    }
+    if (block.type === CLAUDE_BLOCK.TOOL_USE || block.type === "tool_use") {
+      toolUses.push(block);
+      continue;
+    }
+    if (block.type === CLAUDE_BLOCK.TOOL_RESULT || block.type === "tool_result") {
+      toolResults.push(block);
+    }
+    // thinking / redacted_thinking: omit from upstream Cursor payload
   }
 
-  if (message?.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length) {
-    return message.tool_calls.map((call) => {
-      const name = call?.function?.name || "unknown";
-      const args = call?.function?.arguments || "{}";
-      return `Tool call (${call?.id || ""}): ${name}(${args})`;
-    }).join("\n");
+  for (const block of toolResults) {
+    out.push({
+      role: "user",
+      content: `User has used this tool (${block.tool_use_id || "unknown"}): ${extractToolResultContent(block.content)}`,
+    });
   }
 
-  return textFromContent(message?.content);
+  if (toolUses.length) {
+    const used = toolUses.map((block) => {
+      const name = toolDisplayName(block.name);
+      const args = formatToolArgs(block.input);
+      const id = block.id;
+      return id ? `${name}(${args}) [${id}]` : `${name}(${args})`;
+    }).join(", ");
+    const base = textParts.join("\n");
+    out.push({
+      role: "assistant",
+      content: base
+        ? `${base}\n\nUser has used these tools: ${used}`
+        : `User has used these tools: ${used}`,
+    });
+    return out;
+  }
+
+  if (textParts.length) {
+    out.push({ role, content: textParts.join("\n") });
+  }
+  return out;
+}
+
+function normalizeAgentMessages(messages, tools) {
+  const normalized = [];
+
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+
+    if (message.role === "tool" || message.role === "function") {
+      normalized.push({
+        role: "user",
+        content: `User has used this tool${message.tool_call_id ? ` (${message.tool_call_id})` : ""}: ${extractToolResultContent(message.content)}`,
+      });
+      continue;
+    }
+
+    if (message.role === "assistant" && Array.isArray(message.tool_results) && message.tool_results.length) {
+      for (const result of message.tool_results) {
+        normalized.push({
+          role: "user",
+          content: `User has used this tool (${result?.tool_call_id || "unknown"}): ${extractToolResultContent(result?.result_content ?? result?.content)}`,
+        });
+      }
+      const base = textFromContent(message.content);
+      if (base) normalized.push({ role: "assistant", content: base });
+      continue;
+    }
+
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      const base = textFromContent(message.content);
+      const used = formatToolCallsUsed(message.tool_calls);
+      normalized.push({
+        role: "assistant",
+        content: base
+          ? `${base}\n\nUser has used these tools: ${used}`
+          : `User has used these tools: ${used}`,
+      });
+      continue;
+    }
+
+    if (Array.isArray(message.content) && message.content.some((part) =>
+      part?.type === CLAUDE_BLOCK.TOOL_USE
+      || part?.type === CLAUDE_BLOCK.TOOL_RESULT
+      || part?.type === "tool_use"
+      || part?.type === "tool_result"
+    )) {
+      normalized.push(...flattenContentBlocks(message));
+      continue;
+    }
+
+    if (message.role === "assistant" || message.role === "user" || message.role === "system") {
+      const { tool_calls, tool_call_id, tool_results, ...rest } = message;
+      if (Array.isArray(rest.content)) {
+        const text = rest.content
+          .filter((part) => part?.type === CLAUDE_BLOCK.TEXT || part?.type === "text")
+          .map((part) => part.text || "")
+          .join("\n");
+        normalized.push({ ...rest, content: text });
+      } else {
+        normalized.push(rest);
+      }
+      continue;
+    }
+
+    normalized.push({ role: "user", content: textFromContent(message.content) || "" });
+  }
+
+  const declaration = formatAvailableToolsText(tools);
+  return declaration ? appendTextToLastUserMessage(normalized, declaration) : normalized;
+}
+
+/**
+ * Cursor-only gateway shim: Claude Code / OpenAI clients keep their native tool
+ * shapes on the wire to 9router; this converts tool/MCP history and declarations
+ * to plain text before AgentService and never emits mcp_tools upstream.
+ */
+export function normalizeAgentServiceRequest(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const tools = body?.tools || body?.functions || [];
+  const messagesWithTools = normalizeAgentMessages(messages, tools);
+
+  const {
+    tools: _tools,
+    functions: _functions,
+    tool_choice: _toolChoice,
+    parallel_tool_calls: _parallel,
+    ...rest
+  } = body || {};
+
+  return {
+    ...rest,
+    messages: messagesWithTools,
+    tools: [],
+  };
+}
+
+function writeGatewayMcpToolReply(session, mcpArgs, toolName) {
+  const reply = encodeMcpResultError(GATEWAY_TOOL_ERROR);
+  const execClientMessage = concatBuffers(
+    agentMessage(2, reply),
+    mcpArgs?.toolCallId ? agentString(3, mcpArgs.toolCallId) : new Uint8Array(),
+  );
+  session.write(wrapConnectRPCFrame(agentMessage(2, execClientMessage)));
+  debugLog(`[CURSOR AGENT] Stubbed MCP/IDE tool ${toolName || mcpArgs?.toolName || mcpArgs?.name || "unknown"}`);
+}
+
+function writeGatewayExecStubReply(session, execRequest) {
+  let toolCallId = "";
+  for (const values of execRequest.values()) {
+    for (const entry of values) {
+      try {
+        const nested = decodeMessage(entry.value);
+        toolCallId = extractAgentString(nested, 3) || extractAgentString(nested, 35) || toolCallId;
+      } catch {
+        /* non-message payload */
+      }
+    }
+  }
+  const mcpArgs = toolCallId ? { toolCallId } : null;
+  writeGatewayMcpToolReply(session, mcpArgs, "ide_tool");
 }
 
 function encodeHistoryMessage(message) {
-  const content = toolHistoryText(message);
+  const content = textFromContent(message?.content);
   if (!content) return null;
 
   // ConversationHistoryMessage.user / .assistant -> repeated content -> text.
@@ -123,7 +350,7 @@ function encodeHistoryMessage(message) {
   return agentMessage(1, agentMessage(1, agentMessage(1, text)));
 }
 
-export function buildAgentRunFrame(messages, model, tools = []) {
+export function buildAgentRunFrame(messages, model) {
   const system = messages
     .filter((message) => message?.role === "system")
     .map((message) => textFromContent(message.content))
@@ -152,12 +379,10 @@ export function buildAgentRunFrame(messages, model, tools = []) {
   );
   const conversationAction = agentMessage(1, userAction);
   const requestedModel = concatBuffers(agentString(1, model), agentBool(7, true));
-  const mcpTools = tools?.length ? encodeMcpTools(tools) : null;
   const runRequest = concatBuffers(
     // An empty ConversationStateStructure starts a fresh local agent session.
     agentMessage(1, new Uint8Array()),
     agentMessage(2, conversationAction),
-    ...(mcpTools ? [agentMessage(4, mcpTools)] : []),
     ...(system ? [agentString(8, system)] : []),
     agentMessage(9, requestedModel),
   );
@@ -520,10 +745,12 @@ export class CursorExecutor extends BaseExecutor {
       signal.addEventListener("abort", () => requestController.abort(signal.reason), { once: true });
     }
 
+    const agentBody = normalizeAgentServiceRequest(body);
+
     let session;
     try {
       session = this.openAgentHttp2Stream(url, headers, requestController.signal);
-      session.write(buildAgentRunFrame(body.messages || [], model, body.tools || []));
+      session.write(buildAgentRunFrame(agentBody.messages || [], model));
     } catch (error) {
       throw new Error(`Cursor AgentService request failed: ${error.message}`);
     }
@@ -603,38 +830,14 @@ export class CursorExecutor extends BaseExecutor {
               if (execRequest.has(10)) {
                 session.write(createRequestContextResponse());
               } else if (execRequest.has(2)) {
-                // agent.v1.ExecServerMessage.mcp_tool (field 2) — reply with a
-                // toolNotFound / error result so the agent loop continues.
-                // 9router does not host any MCP servers of its own, so any
-                // declared tool is treated as "not implemented" rather than
-                // letting the request stall the stream.
                 const argsBuffer = execRequest.get(2)[0]?.value || new Uint8Array();
                 let mcpArgs;
                 try { mcpArgs = decodeMcpArgs(argsBuffer); } catch { mcpArgs = null; }
                 const toolName = mcpArgs?.toolName || mcpArgs?.name;
-                if (toolName) {
-                  const declaredNames = new Set(
-                    (body?.tools || []).map((tool) => tool?.function?.name || tool?.name).filter(Boolean)
-                  );
-                  const reply = declaredNames.size && declaredNames.has(toolName)
-                    ? encodeMcpResultError("Tool execution is not supported by this gateway")
-                    : encodeMcpResultToolNotFound(toolName);
-                  const execClientMessage = concatBuffers(
-                    agentMessage(2, reply),
-                    mcpArgs?.toolCallId ? agentString(3, mcpArgs.toolCallId) : new Uint8Array(),
-                  );
-                  session.write(wrapConnectRPCFrame(agentMessage(2, execClientMessage)));
-                } else {
-                  finished = true;
-                  onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
-                }
+                writeGatewayMcpToolReply(session, mcpArgs, toolName);
               } else {
-                // Every other ExecServerMessage variant is an editor-backed tool
-                // (shell, read, write, …) that 9router cannot service. Fail the
-                // turn rather than narrating protocol state as assistant text.
-                debugLog(`[CURSOR AGENT] Unsupported exec request fields: ${[...execRequest.keys()].join(",")}`);
-                finished = true;
-                onEvent({ type: "error", value: "Cursor AgentService requested an unsupported IDE tool" });
+                debugLog(`[CURSOR AGENT] Stubbing unsupported exec request fields: ${[...execRequest.keys()].join(",")}`);
+                writeGatewayExecStubReply(session, execRequest);
               }
             }
           });

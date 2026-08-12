@@ -14,6 +14,7 @@ import {
 import {
   isAgentCapableRequest,
   buildAgentRunFrame,
+  normalizeAgentServiceRequest,
 } from "../../open-sse/executors/cursor.js";
 
 // AgentService (agent.v1) codec tests — validate the production implementation
@@ -248,29 +249,38 @@ describe("Cursor AgentService executor helpers (cursor.js)", () => {
       expect(run.has(9)).toBe(true); // requested_model
     });
 
-    it("encodes mcp_tools (field 4) when tools are provided", () => {
+    it("omits mcp_tools and encodes tool declarations as user message text", () => {
       const tools = [{ function: { name: "get_weather", description: "weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }];
-      const frame = unwrap(buildAgentRunFrame([{ role: "user", content: "weather?" }], "gpt-5.2", tools));
+      const normalized = normalizeAgentServiceRequest({
+        messages: [{ role: "user", content: "weather?" }],
+        tools,
+      });
+      expect(normalized.tools).toEqual([]);
+      expect(normalized.messages[0].content).toContain("weather?");
+      expect(normalized.messages[0].content).toContain("Available tools:");
+      expect(normalized.messages[0].content).toContain("get_weather");
+      const frame = unwrap(buildAgentRunFrame(normalized.messages, "gpt-5.2"));
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
-      expect(run.has(4)).toBe(true); // mcp_tools
-      const mcpTools = decodeMessage(run.get(4)[0].value);
-      expect(mcpTools.get(1).length).toBe(1);
+      expect(run.has(4)).toBe(false); // mcp_tools omitted — tools are text-only
     });
 
     it("omits mcp_tools when no tools provided", () => {
-      const frame = unwrap(buildAgentRunFrame([{ role: "user", content: "hi" }], "gpt-5.2", []));
+      const frame = unwrap(buildAgentRunFrame([{ role: "user", content: "hi" }], "gpt-5.2"));
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
       expect(run.has(4)).toBe(false);
     });
 
-    it("encodes conversation_history from prior turns including tool calls/results", () => {
+    it("encodes conversation_history from prior turns including tool calls/results as text", () => {
       const messages = [
         { role: "user", content: "weather in Tokyo?" },
         { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "get_weather", arguments: '{"city":"Tokyo"}' } }] },
         { role: "tool", tool_call_id: "c1", content: "18C cloudy" },
         { role: "user", content: "thanks" },
       ];
-      const frame = unwrap(buildAgentRunFrame(messages, "gpt-5.2", []));
+      const normalized = normalizeAgentServiceRequest({ messages });
+      expect(normalized.messages.some((m) => m.content?.includes("User has used these tools"))).toBe(true);
+      expect(normalized.messages.some((m) => m.content?.includes("User has used this tool"))).toBe(true);
+      const frame = unwrap(buildAgentRunFrame(normalized.messages, "gpt-5.2"));
       const run = decodeMessage(decodeMessage(frame).get(1)[0].value);
       const action = decodeMessage(run.get(2)[0].value);
       const userAction = decodeMessage(action.get(1)[0].value);

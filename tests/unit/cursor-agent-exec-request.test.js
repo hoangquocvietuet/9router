@@ -88,7 +88,7 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(content).toBe("hello");
   });
 
-  it("replies to an MCP tool request with a protocol tool-not-found result", async () => {
+  it("replies to an MCP tool request with a gateway error so the turn continues", async () => {
     const { result, written } = await runAgent({
       frames: [mcpToolRequestFrame("not_declared", "call_1"), textFrame("hello")],
       stream: true,
@@ -99,11 +99,11 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
     const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
-    expect(resultMessage.has(5)).toBe(true); // McpResult.tool_not_found
+    expect(resultMessage.has(2)).toBe(true); // McpResult.error
     expect(await result.response.text()).toContain("hello");
   });
 
-  it("replies with an MCP error for a declared tool", async () => {
+  it("replies with a gateway MCP error for a declared tool", async () => {
     const { result, written } = await runAgent({
       frames: [mcpToolRequestFrame("declared_tool", "call_1"), textFrame("hello")],
       stream: true,
@@ -118,42 +118,40 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(await result.response.text()).toContain("hello");
   });
 
-  it("does not render an unsupported exec request as assistant content", async () => {
+  it("stubs unsupported exec requests and keeps streaming assistant text", async () => {
     const { result } = await runAgent({
       frames: [textFrame("partial answer"), execRequestFrame(2)],
       stream: true,
     });
 
     const body = await result.response.text();
-    expect(body).not.toContain("unsupported IDE tool\\n");
+    expect(body).not.toContain("unsupported IDE tool");
     const events = parseSSE(body);
     const content = events.map((e) => e.choices?.[0]?.delta?.content || "").join("");
     expect(content).toBe("partial answer");
-
-    const errorEvent = events.find((e) => e.error);
-    expect(errorEvent?.error?.message).toContain("unsupported IDE tool");
-    expect(events.some((e) => e.choices?.[0]?.finish_reason === "stop")).toBe(false);
+    expect(events.some((e) => e.error)).toBe(false);
+    expect(events.some((e) => e.choices?.[0]?.finish_reason === "stop")).toBe(true);
   });
 
-  it("drops frames batched behind an unsupported exec request in the same read", async () => {
+  it("continues after unsupported exec requests batched in the same read", async () => {
     const { result } = await runAgent({
       frames: [Buffer.concat([execRequestFrame(2), textFrame("late")])],
       stream: true,
     });
 
     const body = await result.response.text();
-    expect(body).toContain("unsupported IDE tool");
-    expect(body).not.toContain("late");
+    expect(body).not.toContain("unsupported IDE tool");
+    expect(body).toContain("late");
   });
 
-  it("returns a non-200 error body for an unsupported exec request when not streaming", async () => {
+  it("returns assistant text when not streaming after an unsupported exec stub", async () => {
     const { result } = await runAgent({
-      frames: [execRequestFrame(11)],
+      frames: [textFrame("done"), execRequestFrame(11)],
       stream: false,
     });
 
-    expect(result.response.status).not.toBe(200);
+    expect(result.response.status).toBe(200);
     const payload = await result.response.json();
-    expect(payload.error.message).toContain("unsupported IDE tool");
+    expect(payload.choices?.[0]?.message?.content).toBe("done");
   });
 });

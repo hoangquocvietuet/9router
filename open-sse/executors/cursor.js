@@ -8,10 +8,9 @@ import {
   decodeMessage,
   parseConnectRPCFrame,
   extractTextFromResponse,
-  encodeMcpResultSuccess,
-  decodeMcpArgs,
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
+import { handleAgentExecRequest } from "../utils/cursorAgentExec.js";
 import { estimateUsage } from "../utils/usageTracking.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { chatChunkSse, sseChunk } from "../utils/sse.js";
@@ -394,20 +393,6 @@ export function buildSimulatedToolResult(toolName, mcpArgs = null) {
   });
 }
 
-function writeGatewayMcpToolReply(session, mcpArgs, toolName) {
-  const simulated = buildSimulatedToolResult(toolName, mcpArgs);
-  const reply = encodeMcpResultSuccess({
-    textItems: [simulated],
-    isError: false,
-  });
-  const execClientMessage = concatBuffers(
-    agentMessage(2, reply),
-    mcpArgs?.toolCallId ? agentString(3, mcpArgs.toolCallId) : new Uint8Array(),
-  );
-  session.write(wrapConnectRPCFrame(agentMessage(2, execClientMessage)));
-  debugLog(`[CURSOR AGENT] Simulated MCP/IDE tool success ${toolName || mcpArgs?.toolName || mcpArgs?.name || "unknown"}`);
-}
-
 async function readAgentSessionChunk(session, idleMs, deadlineMs) {
   const remaining = deadlineMs - Date.now();
   if (remaining <= 0) return { idle: true };
@@ -416,22 +401,6 @@ async function readAgentSessionChunk(session, idleMs, deadlineMs) {
     session.read(),
     new Promise((resolve) => setTimeout(() => resolve({ idle: true }), waitMs)),
   ]);
-}
-
-function writeGatewayExecStubReply(session, execRequest) {
-  let toolCallId = "";
-  for (const values of execRequest.values()) {
-    for (const entry of values) {
-      try {
-        const nested = decodeMessage(entry.value);
-        toolCallId = extractAgentString(nested, 3) || extractAgentString(nested, 35) || toolCallId;
-      } catch {
-        /* non-message payload */
-      }
-    }
-  }
-  const mcpArgs = toolCallId ? { toolCallId } : null;
-  writeGatewayMcpToolReply(session, mcpArgs, "ide_tool");
 }
 
 function encodeHistoryMessage(message) {
@@ -506,15 +475,6 @@ function decodeAgentFrames(buffer, onFrame) {
     if (!(flags & COMPRESS_FLAG.TRAILER)) onFrame(payload);
   }
   return pending;
-}
-
-function createRequestContextResponse() {
-  // AgentService asks every run for client context. 9router has no IDE file
-  // context, so acknowledge with an empty RequestContext.
-  const requestContextSuccess = agentMessage(1, new Uint8Array());
-  const requestContextResult = agentMessage(1, requestContextSuccess);
-  const execClientMessage = agentMessage(10, requestContextResult);
-  return wrapConnectRPCFrame(agentMessage(2, execClientMessage));
 }
 
 const CURSOR_STREAM_DEBUG = process.env.CURSOR_STREAM_DEBUG === "1";
@@ -955,24 +915,11 @@ export class CursorExecutor extends BaseExecutor {
               }
             }
 
-            // AgentService requests IDE context before producing a response.
-            // Return an empty context; 9router is not coupled to an editor.
             if (serverMessage.has(2)) {
               const execRequest = decodeMessage(serverMessage.get(2)[0].value);
-              if (execRequest.has(10)) {
-                session.write(createRequestContextResponse());
-              } else if (execRequest.has(2)) {
-                execStubs++;
-                const argsBuffer = execRequest.get(2)[0]?.value || new Uint8Array();
-                let mcpArgs;
-                try { mcpArgs = decodeMcpArgs(argsBuffer); } catch { mcpArgs = null; }
-                const toolName = mcpArgs?.toolName || mcpArgs?.name;
-                writeGatewayMcpToolReply(session, mcpArgs, toolName);
-              } else {
-                execStubs++;
-                debugLog(`[CURSOR AGENT] Stubbing unsupported exec request fields: ${[...execRequest.keys()].join(",")}`);
-                writeGatewayExecStubReply(session, execRequest);
-              }
+              execStubs++;
+              const execKind = handleAgentExecRequest(execRequest, session, { buildSimulatedToolResult });
+              debugLog(`[CURSOR AGENT] Exec reply: ${execKind}`);
             }
           });
         }

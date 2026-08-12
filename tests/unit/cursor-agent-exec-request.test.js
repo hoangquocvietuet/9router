@@ -22,7 +22,16 @@ function mcpToolRequestFrame(name, toolCallId) {
     Buffer.from(encodeField(3, LEN, toolCallId)),
     Buffer.from(encodeField(5, LEN, name)),
   ]);
-  const execServerMessage = Buffer.from(encodeField(2, LEN, mcpArgs));
+  const execServerMessage = Buffer.from(encodeField(11, LEN, mcpArgs));
+  return Buffer.from(wrapConnectRPCFrame(encodeField(2, LEN, execServerMessage)));
+}
+
+function readFileRequestFrame(filePath, toolCallId = "call_read") {
+  const readArgs = Buffer.concat([
+    Buffer.from(encodeField(1, LEN, filePath)),
+    Buffer.from(encodeField(2, LEN, toolCallId)),
+  ]);
+  const execServerMessage = Buffer.from(encodeField(7, LEN, readArgs));
   return Buffer.from(wrapConnectRPCFrame(encodeField(2, LEN, execServerMessage)));
 }
 
@@ -101,7 +110,8 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     const responseFrame = parseConnectRPCFrame(written[1]);
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
-    const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
+    expect(execClientMessage.has(11)).toBe(true);
+    const resultMessage = decodeMessage(execClientMessage.get(11)[0].value);
     const success = decodeMessage(resultMessage.get(1)[0].value);
     expect(success.get(2)[0].value).toBe(0); // is_error=false
     expect(body).toContain("hello");
@@ -118,7 +128,8 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     const responseFrame = parseConnectRPCFrame(written[1]);
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
-    const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
+    expect(execClientMessage.has(11)).toBe(true);
+    const resultMessage = decodeMessage(execClientMessage.get(11)[0].value);
     const success = decodeMessage(resultMessage.get(1)[0].value);
     expect(success.get(2)[0].value).toBe(0);
     expect(body).toContain("hello");
@@ -140,7 +151,21 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(content).toBe("after tool done");
   });
 
-  it("stubs unsupported exec requests and keeps streaming assistant text", async () => {
+  it("replies to read_file exec with read_result success", async () => {
+    const { result, written } = await runAgent({
+      frames: [readFileRequestFrame("open-sse/executors/cursor.js"), textFrame("summary")],
+      stream: true,
+    });
+
+    const body = await result.response.text();
+    const responseFrame = parseConnectRPCFrame(written[1]);
+    const clientMessage = decodeMessage(responseFrame.payload);
+    const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
+    expect(execClientMessage.has(7)).toBe(true);
+    expect(body).toContain("summary");
+  });
+
+  it("stubs shell exec requests and keeps streaming assistant text", async () => {
     const { result } = await runAgent({
       frames: [textFrame("partial answer"), execRequestFrame(2)],
       stream: true,

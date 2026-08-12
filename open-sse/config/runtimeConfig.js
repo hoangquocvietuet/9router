@@ -52,6 +52,11 @@ export const SEARXNG_URL = envUrl("SEARXNG_URL", "http://localhost:8888/search")
 // slow reasoning models aren't aborted mid-stream. Env: STREAM_STALL_TIMEOUT_MS.
 export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 1000);
 
+// Cursor AgentService: end the turn if upstream stops sending frames after tool
+// stubs (prevents Claude/paseo clients hanging until their own disconnect).
+export const CURSOR_AGENT_IDLE_TIMEOUT_MS = envMs("CURSOR_AGENT_IDLE_TIMEOUT_MS", 120 * 1000);
+export const CURSOR_AGENT_MAX_TURN_MS = envMs("CURSOR_AGENT_MAX_TURN_MS", 180 * 1000);
+
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 

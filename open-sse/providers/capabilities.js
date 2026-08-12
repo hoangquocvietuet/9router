@@ -327,23 +327,32 @@ export const PATTERN_CAPABILITIES = [
 export function getCapabilitiesForModel(provider, model) {
   if (!model) return { ...DEFAULT_CAPABILITIES };
 
+  // Combo members carry a thinking/effort suffix: "claude-opus-4-8(medium)".
+  // Strip it before every lookup, otherwise the exact-id entries (which declare
+  // the real 1M context windows) never match and the model falls through to the
+  // 200k default — causing valid large prompts to be skipped. Mirrors
+  // stripThinkingSuffix() in translator/concerns/thinkingUnified.js, inlined here
+  // to avoid a circular import (that module imports this function).
+  const suffixMatch = model.match(/^(.*)\([^()]+\)\s*$/);
+  const cleanModel = suffixMatch ? suffixMatch[1].trim() : model;
+
   // Canonical exact lookup strips vendor prefix: "anthropic/claude-opus-4.7" -> "claude-opus-4.7".
-  const baseModel = model.includes("/") ? model.split("/").pop() : model;
+  const baseModel = cleanModel.includes("/") ? cleanModel.split("/").pop() : cleanModel;
 
   // 1. Provider-specific override
   if (provider) {
     const providerCaps = PROVIDER_CAPABILITIES[provider];
-    if (providerCaps?.[model]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[model] };
+    if (providerCaps?.[cleanModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[cleanModel] };
     if (providerCaps?.[baseModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[baseModel] };
   }
 
   // 2. Canonical exact
   if (MODEL_CAPABILITIES[baseModel]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[baseModel] };
-  if (MODEL_CAPABILITIES[model]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[model] };
+  if (MODEL_CAPABILITIES[cleanModel]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[cleanModel] };
 
   // 3. Pattern match (first match wins)
   for (const { pattern, caps } of PATTERN_CAPABILITIES) {
-    if (matchPattern(pattern, baseModel) || matchPattern(pattern, model)) {
+    if (matchPattern(pattern, baseModel) || matchPattern(pattern, cleanModel)) {
       return { ...DEFAULT_CAPABILITIES, ...caps };
     }
   }

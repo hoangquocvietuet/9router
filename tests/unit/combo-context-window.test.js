@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
 import { handleComboChat } from "../../open-sse/services/combo.js";
 
 describe("handleComboChat context-window filtering", () => {
@@ -39,5 +40,36 @@ describe("handleComboChat context-window filtering", () => {
 
     expect(handleSingleModel).toHaveBeenCalledTimes(1);
     expect(handleSingleModel.mock.calls[0][1]).toBe("ocg/kimi-k2.7-code(max)");
+  });
+
+  it("strips thinking/effort suffixes before the context-window lookup", async () => {
+    // Regression: combo members are stored as "cc/claude-opus-4-8(medium)". The
+    // (medium) suffix must not break the exact-id capabilities lookup, which
+    // declares a 1M context window for claude-opus-4-8 — otherwise a ~300k-token
+    // prompt is "skipped" and Claude never gets routed to (the 9router skip log).
+    const handleSingleModel = vi.fn(async () => ({ ok: true, status: 200, statusText: "OK" }));
+    const log = { info: vi.fn(), warn: vi.fn() };
+
+    // ~1.2M chars / 4 ≈ 300k estimated tokens — fits the 1M Claude window, not a 200k one.
+    const hugeContent = "x".repeat(1_200_000);
+    const body = { messages: [{ role: "user", content: hugeContent }] };
+
+    await handleComboChat({
+      body,
+      models: ["cc/claude-opus-4-8(medium)"],
+      handleSingleModel,
+      log,
+      comboName: "test",
+      comboStrategy: "fallback",
+    });
+
+    expect(handleSingleModel).toHaveBeenCalledTimes(1);
+    expect(handleSingleModel.mock.calls[0][1]).toBe("cc/claude-opus-4-8(medium)");
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("No combo member"));
+  });
+
+  it("treats a suffixed claude model as 1M, not the 200k pattern fallback", () => {
+    const caps = getCapabilitiesForModel("cc", "claude-opus-4-8(medium)");
+    expect(caps.contextWindow).toBe(1_000_000);
   });
 });

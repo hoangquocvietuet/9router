@@ -728,6 +728,130 @@ export function decodeMessage(data) {
   return fields;
 }
 
+function encodeFixed64(field, value) {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setFloat64(0, value, true);
+  return concatArrays(encodeVarint((field << 3) | WIRE_TYPE.FIXED64), bytes);
+}
+
+function decodeString(fields, field) {
+  const value = fields.get(field)?.[0]?.value;
+  return value ? textDecoder.decode(value) : "";
+}
+
+export function encodeAgentValue(value) {
+  if (value === null) return encodeField(1, WIRE_TYPE.VARINT, 0);
+  if (typeof value === "number") return encodeFixed64(2, value);
+  if (typeof value === "string") return encodeField(3, WIRE_TYPE.LEN, value);
+  if (typeof value === "boolean") return encodeField(4, WIRE_TYPE.VARINT, value ? 1 : 0);
+
+  if (Array.isArray(value)) {
+    return encodeField(6, WIRE_TYPE.LEN, concatArrays(
+      ...value.map((item) => encodeField(1, WIRE_TYPE.LEN, encodeAgentValue(item)))
+    ));
+  }
+
+  const fields = Object.entries(value || {}).map(([key, item]) =>
+    encodeField(1, WIRE_TYPE.LEN, concatArrays(
+      encodeField(1, WIRE_TYPE.LEN, key),
+      encodeField(2, WIRE_TYPE.LEN, encodeAgentValue(item))
+    ))
+  );
+  return encodeField(5, WIRE_TYPE.LEN, concatArrays(...fields));
+}
+
+export function decodeAgentValue(data) {
+  const fields = decodeMessage(data);
+  if (fields.has(1)) return null;
+  if (fields.has(2)) return new DataView(fields.get(2)[0].value.buffer, fields.get(2)[0].value.byteOffset, 8).getFloat64(0, true);
+  if (fields.has(3)) return decodeString(fields, 3);
+  if (fields.has(4)) return fields.get(4)[0].value !== 0;
+  if (fields.has(5)) {
+    const object = {};
+    const struct = decodeMessage(fields.get(5)[0].value);
+    for (const entry of struct.get(1) || []) {
+      const pair = decodeMessage(entry.value);
+      const key = decodeString(pair, 1);
+      const encodedValue = pair.get(2)?.[0]?.value;
+      if (key && encodedValue) object[key] = decodeAgentValue(encodedValue);
+    }
+    return object;
+  }
+  if (fields.has(6)) {
+    const list = decodeMessage(fields.get(6)[0].value);
+    return (list.get(1) || []).map((item) => decodeAgentValue(item.value));
+  }
+  return null;
+}
+
+export function encodeMcpToolDefinition(tool) {
+  const functionDefinition = tool?.function || tool || {};
+  const name = functionDefinition.name || "";
+  const description = functionDefinition.description || "";
+  const inputSchema = functionDefinition.parameters || functionDefinition.inputSchema || tool?.inputSchema || {};
+
+  return concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, name),
+    ...(description ? [encodeField(2, WIRE_TYPE.LEN, description)] : []),
+    encodeField(3, WIRE_TYPE.LEN, encodeAgentValue(inputSchema)),
+    encodeField(4, WIRE_TYPE.LEN, "9router"),
+    encodeField(5, WIRE_TYPE.LEN, name)
+  );
+}
+
+export function encodeMcpTools(tools = []) {
+  return concatArrays(...tools.map((tool) =>
+    encodeField(1, WIRE_TYPE.LEN, encodeMcpToolDefinition(tool))
+  ));
+}
+
+export function decodeMcpArgs(data) {
+  const fields = decodeMessage(data);
+  const args = {};
+  for (const encodedEntry of fields.get(2) || []) {
+    const entry = decodeMessage(encodedEntry.value);
+    const key = decodeString(entry, 1);
+    const value = entry.get(2)?.[0]?.value;
+    if (key && value) args[key] = decodeAgentValue(value);
+  }
+  return {
+    name: decodeString(fields, 1),
+    args,
+    toolCallId: decodeString(fields, 3),
+    toolName: decodeString(fields, 5),
+  };
+}
+
+function encodeMcpTextContent(text) {
+  return encodeField(1, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, text));
+}
+
+function encodeMcpImageContent({ data, mimeType }) {
+  return encodeField(2, WIRE_TYPE.LEN, concatArrays(
+    encodeField(1, WIRE_TYPE.LEN, data),
+    encodeField(2, WIRE_TYPE.LEN, mimeType || "application/octet-stream")
+  ));
+}
+
+export function encodeMcpResultSuccess({ textItems = [], imageItems = [], isError = false } = {}) {
+  const content = [
+    ...textItems.map((text) => encodeField(1, WIRE_TYPE.LEN, encodeMcpTextContent(text))),
+    ...imageItems.map((image) => encodeField(1, WIRE_TYPE.LEN, encodeMcpImageContent(image))),
+  ];
+  return encodeField(1, WIRE_TYPE.LEN, concatArrays(
+    ...content,
+    encodeField(2, WIRE_TYPE.VARINT, isError ? 1 : 0)
+  ));
+}
+
+export function encodeMcpResultError(message) {
+  return encodeField(2, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, message));
+}
+
+export function encodeMcpResultToolNotFound(toolName) {
+  return encodeField(5, WIRE_TYPE.LEN, encodeField(1, WIRE_TYPE.LEN, toolName));
+}
+
 // ==================== RESPONSE PARSING ====================
 
 export function parseConnectRPCFrame(buffer) {

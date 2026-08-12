@@ -1,8 +1,63 @@
 const http = require("http");
+const fs = require("fs");
 const path = require("path");
 const { pathToFileURL } = require("url");
 
 const origCreate = http.createServer.bind(http);
+
+// One-shot capture of the next real Claude Code request with a large tool catalogue.
+// Safe only on the h2c replay path (full body already buffered). HTTP/1.1 teeing
+// breaks Next body parsing, so it is intentionally not used here.
+const TOOL_CAPTURE_PATH = process.env.CURSOR_TOOL_CAPTURE_PATH
+  || "/root/.9router/captures/claude-code-169-tools.json";
+const TOOL_CAPTURE_MIN = Number(process.env.CURSOR_TOOL_CAPTURE_MIN || 100);
+let toolCaptureArmed = process.env.CURSOR_TOOL_CAPTURE === "1"
+  && !fs.existsSync(TOOL_CAPTURE_PATH);
+
+function maybeCaptureToolBody(rawBuf) {
+  if (!toolCaptureArmed || !rawBuf?.length) return;
+  try {
+    const body = JSON.parse(rawBuf.toString("utf8"));
+    const tools = body?.tools || body?.functions;
+    if (!Array.isArray(tools) || tools.length < TOOL_CAPTURE_MIN) return;
+    fs.mkdirSync(path.dirname(TOOL_CAPTURE_PATH), { recursive: true });
+    const task = extractCaptureTask(body?.messages || []);
+    fs.writeFileSync(TOOL_CAPTURE_PATH, JSON.stringify({
+      capturedAt: new Date().toISOString(),
+      source: "claude-code-live-request",
+      toolCount: tools.length,
+      model: body?.model || null,
+      task,
+      tools,
+      messages: body?.messages || [],
+    }));
+    toolCaptureArmed = false;
+    console.log(`[TOOL-CAPTURE] wrote ${tools.length} tools → ${TOOL_CAPTURE_PATH}`);
+  } catch (error) {
+    console.error("[TOOL-CAPTURE] failed:", error && error.message ? error.message : error);
+  }
+}
+
+function extractCaptureTask(messages) {
+  for (const message of messages) {
+    if (message?.role !== "user") continue;
+    let text = "";
+    if (typeof message.content === "string") text = message.content;
+    else if (Array.isArray(message.content)) {
+      text = message.content
+        .filter((part) => part?.type === "text" && part.text)
+        .map((part) => part.text)
+        .join("\n");
+    }
+    if (!text.trim()) continue;
+    const withoutReminders = text
+      .split(/<\/system-reminder>/i)
+      .map((part) => part.replace(/<system-reminder>[\s\S]*$/i, "").trim())
+      .filter(Boolean);
+    return withoutReminders.at(-1) || text.trim();
+  }
+  return "";
+}
 
 let backgroundRefreshStarted = false;
 
@@ -84,7 +139,11 @@ http.createServer = (...args) => {
       // Replay the upgraded request through the existing HTTP/1.1 handler.
       const replay = new http.IncomingMessage(socket);
       Object.assign(replay, { method: req.method, url: req.url, headers: req.headers, complete: true });
-      if (received) replay.push(Buffer.concat(chunks, received).subarray(0, contentLength));
+      const bodyBuf = received
+        ? Buffer.concat(chunks, received).subarray(0, contentLength)
+        : Buffer.alloc(0);
+      maybeCaptureToolBody(bodyBuf);
+      if (bodyBuf.length) replay.push(bodyBuf);
       replay.push(null);
       const res = new http.ServerResponse(replay);
       res.shouldKeepAlive = false;

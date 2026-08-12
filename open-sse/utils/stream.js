@@ -461,7 +461,13 @@ export function createSSEStream(options = {}) {
           }, state?.usage, ttftAt);
         }
       } catch (error) {
-        console.log("Error in flush:", error);
+        // Previously swallowed with console.log only — the transform's flush
+        // would then return normally and the stream closed silently, hiding a
+        // translation failure behind what looks like a clean completion.
+        // Surface it: log at error level and error the controller so downstream
+        // (createDisconnectAwareStream) sees a real failure instead of EOF.
+        console.error(`[SSE] flush failed | provider=${provider} | model=${model}:`, error);
+        controller.error(error);
       }
     }
   });

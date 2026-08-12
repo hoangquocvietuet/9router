@@ -95,25 +95,46 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
  * for long periods while raw bytes still flow (e.g. Kiro EventStream
  * binary frames buffering, Claude reasoning streams).
  */
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
+// Real terminal markers for the two current onAbortTerminal consumers: Claude
+// translation ends in "message_stop"; Responses passthrough/translation ends
+// in the "[DONE]" sentinel. A response.completed/failed event alone is not
+// sufficient here: preserving the existing Responses abort behavior requires
+// synthesizing its trailing [DONE] when that sentinel never arrives. Detected
+// as raw substrings (not JSON-parsed) since this layer only sees encoded SSE
+// bytes; each is written by stream.js as a single enqueue per event, so a
+// marker is never split across the chunks read here.
+const STREAM_TERMINAL_MARKERS = ["event: message_stop", "data: [DONE]"];
+
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, pipeStats = null, streamMeta = null) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
+  let emittedChunks = 0; // translated SSE chunks forwarded to the client
+  let sawRealTerminal = false;
+  const terminalDecoder = onAbortTerminal ? new TextDecoder("utf-8", { fatal: false }) : null;
 
-  // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
-  const emitTerminal = (controller) => {
+  // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE],
+  // or a Claude error message_delta + message_stop) once.
+  const emitTerminal = (controller, reason) => {
     if (terminalEmitted || !onAbortTerminal) return;
     terminalEmitted = true;
+    if (pipeStats) {
+      pipeStats.terminalEmitted = true;
+      pipeStats.terminalSynthesized = true;
+    }
     try {
       const bytes = onAbortTerminal();
       if (bytes) controller.enqueue(bytes);
     } catch { /* best-effort terminal */ }
+    console.warn(
+      `[STREAM] synthesized terminal | reason=${reason} | provider=${streamMeta?.provider || "unknown"} | model=${streamMeta?.model || "unknown"} | request=${streamMeta?.requestTag || "unknown"} | chunks=${pipeStats?.upstreamChunks || 0} bytes=${pipeStats?.upstreamBytes || 0} events=${pipeStats?.emittedChunks || 0}`
+    );
   };
 
   return new ReadableStream({
     async pull(controller) {
       if (!streamController.isConnected()) {
-        emitTerminal(controller);
+        if (!sawRealTerminal) emitTerminal(controller, "disconnect");
         controller.close();
         return;
       }
@@ -122,9 +143,25 @@ export function createDisconnectAwareStream(transformStream, streamController, o
         const { done, value } = await reader.read();
 
         if (done) {
+          // Clean upstream EOF without a real terminal event is the silent
+          // empty/truncated-200 case: either nothing valid reached the client,
+          // or the stream stopped partway (e.g. after message_start but before
+          // message_stop). Synthesize a terminal so the client sees a real
+          // end-of-stream (or error) instead of an empty/incomplete body
+          // committed as HTTP 200.
+          if (!sawRealTerminal) emitTerminal(controller, "eof");
           streamController.handleComplete();
           controller.close();
           return;
+        }
+        emittedChunks++;
+        if (pipeStats) pipeStats.emittedChunks = emittedChunks;
+        if (terminalDecoder && !sawRealTerminal) {
+          const text = terminalDecoder.decode(value, { stream: true });
+          if (STREAM_TERMINAL_MARKERS.some(marker => text.includes(marker))) {
+            sawRealTerminal = true;
+            if (pipeStats) pipeStats.terminalEmitted = true;
+          }
         }
         controller.enqueue(value);
       } catch (error) {
@@ -152,10 +189,11 @@ export function createDisconnectAwareStream(transformStream, streamController, o
           code === "UND_ERR_SOCKET";
 
         // Graceful close on network/abort, or when a structured terminal is available
-        // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
+        // (Responses passthrough prefers response.failed + [DONE] over a raw transport error;
+        //  Claude-target translation prefers error-shaped message_delta + message_stop.)
         try {
           if (!wasConnected || isNetworkClose || onAbortTerminal) {
-            emitTerminal(controller);
+            if (!sawRealTerminal) emitTerminal(controller, "error");
             controller.close();
           } else {
             controller.error(error);
@@ -188,13 +226,19 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, streamMeta = null) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
   let lastChunkAt = Date.now();
   const t0 = Date.now();
   const tag = "STREAM";
+  // Shared with createDisconnectAwareStream so the DONE/error line can report
+  // translated-event count + whether a terminal was synthesized. Missing TTFT +
+  // zero translated events is the fingerprint of a truncated/empty-200 stream.
+  const pipeStats = { upstreamChunks: 0, upstreamBytes: 0, emittedChunks: 0, terminalEmitted: false, terminalSynthesized: false };
+  const streamSummary = () =>
+    `chunks=${chunkCount} bytes=${totalBytes} events=${pipeStats.emittedChunks} terminal=${pipeStats.terminalEmitted} terminalSynth=${pipeStats.terminalSynthesized} dur=${Date.now() - t0}ms`;
   const clearStall = () => {
     if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
   };
@@ -215,9 +259,9 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     signal: streamController.signal,
     startTime: streamController.startTime,
     isConnected: () => streamController.isConnected(),
-    handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleComplete(); },
-    handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleError(e); },
-    handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleDisconnect(r); },
+    handleComplete: () => { dbg(tag, `complete | ${streamSummary()}`); clearStall(); streamController.handleComplete(); },
+    handleError: (e) => { dbg(tag, `error: ${e?.message} | ${streamSummary()}`); clearStall(); streamController.handleError(e); },
+    handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | ${streamSummary()}`); clearStall(); streamController.handleDisconnect(r); },
     abort: () => { clearStall(); streamController.abort(); }
   };
 
@@ -229,6 +273,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
       chunkCount++;
       const sz = chunk?.byteLength || chunk?.length || 0;
       totalBytes += sz;
+      pipeStats.upstreamChunks = chunkCount;
+      pipeStats.upstreamBytes = totalBytes;
       const now = Date.now();
       const gap = now - lastChunkAt;
       lastChunkAt = now;
@@ -248,7 +294,9 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream(
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
-    onAbortTerminal
+    onAbortTerminal,
+    pipeStats,
+    streamMeta
   );
 }
 

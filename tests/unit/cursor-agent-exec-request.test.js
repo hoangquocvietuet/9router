@@ -90,7 +90,7 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     expect(content).toBe("hello");
   });
 
-  it("replies to an MCP tool request with a gateway error so the turn continues", async () => {
+  it("replies to an MCP tool request with a simulated success so the turn continues", async () => {
     const { result, written } = await runAgent({
       frames: [mcpToolRequestFrame("not_declared", "call_1"), textFrame("hello")],
       stream: true,
@@ -102,11 +102,12 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
     const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
-    expect(resultMessage.has(1)).toBe(true); // McpResult payload (is_error)
+    const success = decodeMessage(resultMessage.get(1)[0].value);
+    expect(success.get(2)[0].value).toBe(0); // is_error=false
     expect(body).toContain("hello");
   });
 
-  it("replies with a gateway MCP error for a declared tool", async () => {
+  it("replies with simulated success for a declared tool", async () => {
     const { result, written } = await runAgent({
       frames: [mcpToolRequestFrame("declared_tool", "call_1"), textFrame("hello")],
       stream: true,
@@ -118,8 +119,25 @@ describe("CursorExecutor AgentService exec_request handling", () => {
     const clientMessage = decodeMessage(responseFrame.payload);
     const execClientMessage = decodeMessage(clientMessage.get(2)[0].value);
     const resultMessage = decodeMessage(execClientMessage.get(2)[0].value);
-    expect(resultMessage.has(1)).toBe(true); // McpResult payload (is_error)
+    const success = decodeMessage(resultMessage.get(1)[0].value);
+    expect(success.get(2)[0].value).toBe(0);
     expect(body).toContain("hello");
+  });
+
+  it("continues streaming after multiple simulated tool exec replies", async () => {
+    const { result } = await runAgent({
+      frames: [
+        mcpToolRequestFrame("read_file", "call_1"),
+        textFrame("after tool "),
+        mcpToolRequestFrame("grep", "call_2"),
+        textFrame("done"),
+      ],
+      stream: true,
+    });
+
+    const body = await result.response.text();
+    const content = parseSSE(body).map((e) => e.choices?.[0]?.delta?.content || "").join("");
+    expect(content).toBe("after tool done");
   });
 
   it("stubs unsupported exec requests and keeps streaming assistant text", async () => {

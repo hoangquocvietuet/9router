@@ -5,7 +5,7 @@ import {
   normalizeAgentServiceRequest,
   bodyHasToolSignals,
   shouldUseCursorAgentService,
-  agentTurnIdleThresholdMs,
+  buildSimulatedToolResult,
 } from "../../open-sse/executors/cursor.js";
 
 describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
@@ -72,9 +72,15 @@ describe("normalizeAgentServiceRequest (Cursor gateway only)", () => {
     expect(shouldUseCursorAgentService(body)).toBe(true);
   });
 
-  it("uses a shorter idle window after text plus exec stubs", () => {
-    expect(agentTurnIdleThresholdMs({ hadText: true, execStubs: 2 })).toBe(8 * 1000);
-    expect(agentTurnIdleThresholdMs({ hadText: true, execStubs: 0 })).toBe(120 * 1000);
-    expect(agentTurnIdleThresholdMs({ hadText: false, execStubs: 1 })).toBe(120 * 1000);
+  it("builds simulated success payloads for common IDE tool names", () => {
+    const read = JSON.parse(buildSimulatedToolResult("read_file", { args: { path: "/tmp/a.ts" } }));
+    expect(read.path).toBe("/tmp/a.ts");
+    expect(read.content).toBe("");
+
+    const grep = JSON.parse(buildSimulatedToolResult("grep", { args: { pattern: "foo" } }));
+    expect(grep.matches).toEqual([]);
+
+    const generic = JSON.parse(buildSimulatedToolResult("mcp__paseo__browser_snapshot"));
+    expect(generic.ok).toBe(true);
   });
 });

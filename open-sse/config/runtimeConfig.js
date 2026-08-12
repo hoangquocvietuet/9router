@@ -55,9 +55,6 @@ export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 10
 // Cursor AgentService: end the turn if upstream stops sending frames after tool
 // stubs (prevents Claude/paseo clients hanging until their own disconnect).
 export const CURSOR_AGENT_IDLE_TIMEOUT_MS = envMs("CURSOR_AGENT_IDLE_TIMEOUT_MS", 120 * 1000);
-// After assistant text plus stubbed IDE/MCP exec replies, Cursor often never
-// emits turn-complete; end the turn once upstream goes quiet for this window.
-export const CURSOR_AGENT_EXEC_TAIL_IDLE_MS = envMs("CURSOR_AGENT_EXEC_TAIL_IDLE_MS", 8 * 1000);
 export const CURSOR_AGENT_MAX_TURN_MS = envMs("CURSOR_AGENT_MAX_TURN_MS", 180 * 1000);
 
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.

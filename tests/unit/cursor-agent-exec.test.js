@@ -5,14 +5,9 @@ import { decodeMessage, encodeField, parseConnectRPCFrame } from "../../open-sse
 
 const LEN = 2;
 
-function execFrame(fields) {
-  const execServerMessage = Buffer.concat(fields);
-  return Buffer.from(encodeField(2, LEN, execServerMessage));
-}
-
 describe("cursorAgentExec", () => {
   it("extracts exec id and exec_id from server messages", () => {
-    const execRequest = decodeMessage(execFrame([
+    const execRequest = decodeMessage(Buffer.concat([
       Buffer.from(encodeField(1, 0, 42)),
       Buffer.from(encodeField(15, LEN, "exec-abc")),
       Buffer.from(encodeField(7, LEN, Buffer.from(encodeField(1, LEN, "README.md")))),
@@ -22,7 +17,7 @@ describe("cursorAgentExec", () => {
 
   it("replies to read_args with read_result on field 7", () => {
     const written = [];
-    const execRequest = decodeMessage(execFrame([
+    const execRequest = decodeMessage(Buffer.concat([
       Buffer.from(encodeField(1, 0, 7)),
       Buffer.from(encodeField(15, LEN, "exec-read")),
       Buffer.from(encodeField(7, LEN, Buffer.concat([
